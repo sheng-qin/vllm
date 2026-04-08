@@ -141,6 +141,28 @@ def _get_backend_priorities(
             ]
 
 
+def _get_env_sparse_prefill_backend(
+    attn_selector_config: "AttentionSelectorConfig",
+) -> AttentionBackendEnum | None:
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.sparse_prefill_utils import (
+        get_sparse_prefill_topk_config,
+        is_sparse_prefill_enabled,
+    )
+
+    if not is_sparse_prefill_enabled():
+        return None
+    if attn_selector_config.use_mla or attn_selector_config.use_sparse:
+        return None
+    if attn_selector_config.attn_type != AttentionType.DECODER:
+        return None
+
+    # Parse and validate the JSON/key eagerly so configuration errors surface
+    # during backend selection instead of the first forward pass.
+    get_sparse_prefill_topk_config()
+    return AttentionBackendEnum.SPARSE_PREFILL_FLASH_ATTN
+
+
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -282,6 +304,34 @@ class CudaPlatformBase(Platform):
     ) -> str:
         device_capability = cls.get_device_capability()
         assert device_capability is not None
+
+        if selected_backend is None:
+            env_backend = _get_env_sparse_prefill_backend(attn_selector_config)
+            if env_backend is not None:
+                try:
+                    backend_class = env_backend.get_class()
+                    invalid_reasons = backend_class.validate_configuration(
+                        device_capability=device_capability,
+                        **attn_selector_config._asdict(),
+                    )
+                except ImportError:
+                    raise
+                if not invalid_reasons:
+                    selected_backend = env_backend
+                    logger.info_once(
+                        "Using %s backend due to sparse-prefill env configuration.",
+                        selected_backend.name,
+                        scope="local",
+                    )
+                else:
+                    logger.warning_once(
+                        "Sparse-prefill env configuration requested %s, but it is "
+                        "not valid for this configuration (%s). Falling back to "
+                        "default backend selection.",
+                        env_backend.name,
+                        ", ".join(invalid_reasons),
+                        scope="local",
+                    )
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
