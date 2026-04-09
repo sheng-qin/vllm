@@ -16,6 +16,7 @@ import torch.nn.functional as F
 AUTOPTQ_VLLM_SPARSE_ENABLE_ENV = "AUTOPTQ_VLLM_SPARSE_ENABLE"
 AUTOPTQ_SPARSE_RUNTIME_JSON_ENV = "AUTOPTQ_SPARSE_RUNTIME_JSON"
 AUTOPTQ_SPARSE_RUNTIME_KEY_ENV = "AUTOPTQ_SPARSE_RUNTIME_KEY"
+AUTOPTQ_VLLM_SPARSE_IMPL_ENV = "AUTOPTQ_VLLM_SPARSE_IMPL"
 
 DEFAULT_PV_BLOCK_SIZE = 128
 
@@ -38,6 +39,20 @@ def _parse_env_flag(value: str | None) -> bool:
 
 def is_sparse_prefill_enabled() -> bool:
     return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV))
+
+
+def get_sparse_prefill_impl_mode() -> str:
+    value = os.getenv(AUTOPTQ_VLLM_SPARSE_IMPL_ENV)
+    if value is None or not value.strip():
+        return "auto"
+
+    mode = value.strip().lower()
+    if mode not in {"auto", "triton", "torch"}:
+        raise ValueError(
+            f"{AUTOPTQ_VLLM_SPARSE_IMPL_ENV} must be one of "
+            "'auto', 'triton', or 'torch'."
+        )
+    return mode
 
 
 def _require_positive_int(value: object, field_name: str) -> int:
@@ -116,6 +131,18 @@ def is_full_prefill_request(query_len: int, seq_len: int) -> bool:
     return query_len == seq_len
 
 
+def is_cached_prefix_prefill_request(query_len: int, seq_len: int) -> bool:
+    if query_len <= 1:
+        return False
+    return query_len < seq_len
+
+
+def is_sparse_prefill_request(query_len: int, seq_len: int) -> bool:
+    return is_full_prefill_request(query_len, seq_len) or is_cached_prefix_prefill_request(
+        query_len, seq_len
+    )
+
+
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
@@ -125,6 +152,90 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(batch_size, num_kv_heads, n_rep, seq_len, head_dim)
         .reshape(batch_size, num_kv_heads * n_rep, seq_len, head_dim)
     )
+
+
+def _flatten_flash_kv_cache(
+    kv_cache: torch.Tensor | None,
+    *,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_cache_dtype: str,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+    if kv_cache is None or kv_cache.numel() == 0:
+        return None, None, 0
+    if kv_cache.dim() != 5 or kv_cache.shape[0] != 2:
+        raise NotImplementedError(
+            "Sparse prefill backend currently expects flash-style KV cache with "
+            f"shape [2, num_blocks, block_size, num_kv_heads, head_dim], got {tuple(kv_cache.shape)}."
+        )
+    if str(kv_cache_dtype).startswith("fp8"):
+        kv_cache = kv_cache.view(torch.float8_e4m3fn)
+    block_size = int(kv_cache.shape[2])
+    key_cache = kv_cache[0].reshape(-1, num_kv_heads, head_dim)
+    value_cache = kv_cache[1].reshape(-1, num_kv_heads, head_dim)
+    return key_cache, value_cache, block_size
+
+
+def _reconstruct_sequence_slots(
+    block_table_row: torch.Tensor,
+    *,
+    seq_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+
+    num_blocks = math.ceil(seq_len / block_size)
+    if block_table_row.numel() < num_blocks:
+        raise ValueError(
+            "Sparse prefill backend requires enough block-table entries to "
+            f"reconstruct the full sequence, got {block_table_row.numel()} entries "
+            f"for seq_len={seq_len} and block_size={block_size}."
+        )
+
+    blocks = block_table_row.reshape(-1)[:num_blocks].to(dtype=torch.long)
+    token_positions = torch.arange(seq_len, device=blocks.device, dtype=torch.long)
+    block_offsets = torch.div(token_positions, block_size, rounding_mode="floor")
+    token_offsets = token_positions.remainder(block_size)
+    return blocks.index_select(0, block_offsets) * block_size + token_offsets
+
+
+def gather_full_sequence_kv_from_paged_cache(
+    *,
+    kv_cache: torch.Tensor | None,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_cache_dtype: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key_cache, value_cache, block_size = _flatten_flash_kv_cache(
+        kv_cache,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    if key_cache is None or value_cache is None or block_size <= 0:
+        raise ValueError(
+            "Sparse prefill backend could not read the paged KV cache for a "
+            "cached-prefix request."
+        )
+    if block_table_row.numel() == 0:
+        raise ValueError(
+            "Sparse prefill backend requires a non-empty block-table row for "
+            "cached-prefix requests."
+        )
+
+    slots = _reconstruct_sequence_slots(
+        block_table_row.to(device=key_cache.device),
+        seq_len=seq_len,
+        block_size=block_size,
+    )
+    full_key = key_cache.index_select(0, slots)
+    full_value = value_cache.index_select(0, slots)
+    return full_key, full_value
 
 
 def _broadcast_attention_mask(
@@ -411,7 +522,7 @@ def run_sparse_prefill_attention(
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Run the prototype PyTorch sparse attention path for one full-prefill request.
+    """Run the prototype PyTorch sparse attention path for one prefill request.
 
     Input shapes:
     - query: [q_len, num_heads, head_dim]
