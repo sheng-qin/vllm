@@ -221,6 +221,112 @@ def build_sparse_topk_block_metadata_from_paged_cache(
 
 
 @triton.jit
+def _smallk_weighted_value_sum(
+    probs,
+    value,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    if BLOCK_N == 1:
+        return probs.to(tl.float32) * value.to(tl.float32)
+
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    lane_ids = tl.arange(0, BLOCK_N)
+    probs_f32 = probs.to(tl.float32)
+    value_f32 = value.to(tl.float32)
+    for lane_idx in tl.static_range(0, BLOCK_N):
+        lane_mask = lane_ids == lane_idx
+        prob_lane = tl.sum(tl.where(lane_mask[None, :], probs_f32, 0.0), axis=1)
+        value_lane = tl.sum(tl.where(lane_mask[:, None], value_f32, 0.0), axis=0)
+        acc += prob_lane[:, None] * value_lane[None, :]
+    return acc
+
+
+def _fully_masked_row_mask_for_k1(
+    *,
+    topk_metadata: SparseTopKBlockMetadata,
+    q_len: int,
+    q_block: int,
+    device: torch.device,
+) -> torch.Tensor:
+    q_positions = torch.arange(q_len, device=device, dtype=torch.int64)
+    q_block_idx = torch.div(q_positions, q_block, rounding_mode="floor")
+    selected = topk_metadata.topk_block_indices.to(device=device, dtype=torch.int64).index_select(
+        1,
+        q_block_idx,
+    )
+    q_abs = q_positions + int(topk_metadata.q_abs_offset)
+    has_valid = (
+        (selected >= 0)
+        & (selected <= q_abs.view(1, q_len, 1))
+    ).any(dim=-1)
+    return (~has_valid).transpose(0, 1).contiguous()
+
+
+def _gather_paged_value_mean(
+    *,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+) -> torch.Tensor:
+    cache_block_size = int(value_cache.shape[1])
+    num_required_blocks = _ceil_div(seq_len, cache_block_size)
+    if block_table_row.numel() < num_required_blocks:
+        raise ValueError(
+            "Sparse Triton prefill requires enough block-table entries to read "
+            f"seq_len={seq_len}, cache_block_size={cache_block_size}, "
+            f"got {block_table_row.numel()} entries."
+        )
+
+    device = value_cache.device
+    block_table_row = block_table_row.to(device=device, dtype=torch.long).reshape(-1)
+    token_positions = torch.arange(seq_len, device=device, dtype=torch.long)
+    block_ids = block_table_row.index_select(
+        0,
+        torch.div(token_positions, cache_block_size, rounding_mode="floor"),
+    )
+    slots = block_ids * cache_block_size + token_positions.remainder(cache_block_size)
+    flat_value = value_cache.reshape(-1, value_cache.shape[2], value_cache.shape[3])
+    return flat_value.index_select(0, slots).to(torch.float32).mean(dim=0)
+
+
+def _apply_k1_reference_fallback(
+    *,
+    output: torch.Tensor,
+    value_mean: torch.Tensor,
+    topk_metadata: SparseTopKBlockMetadata,
+    q_block: int,
+) -> torch.Tensor:
+    fully_masked = _fully_masked_row_mask_for_k1(
+        topk_metadata=topk_metadata,
+        q_len=int(output.shape[0]),
+        q_block=q_block,
+        device=output.device,
+    )
+    if not bool(fully_masked.any().item()):
+        return output
+
+    num_heads = int(output.shape[1])
+    num_kv_heads = int(value_mean.shape[0])
+    num_queries_per_kv = num_heads // num_kv_heads
+    kv_head_idx = torch.div(
+        torch.arange(num_heads, device=output.device, dtype=torch.long),
+        num_queries_per_kv,
+        rounding_mode="floor",
+    )
+    mean_per_head = value_mean.to(device=output.device, dtype=output.dtype).index_select(
+        0,
+        kv_head_idx,
+    )
+    return torch.where(
+        fully_masked.unsqueeze(-1),
+        mean_per_head.unsqueeze(0),
+        output,
+    )
+
+
+@triton.jit
 def _sparse_prefill_attention_contiguous_kernel(
     query_ptr,
     key_ptr,
@@ -257,6 +363,7 @@ def _sparse_prefill_attention_contiguous_kernel(
     TOPK: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     HEAD_SIZE_PADDED: tl.constexpr,
+    USE_SMALL_K: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -313,7 +420,15 @@ def _sparse_prefill_attention_contiguous_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(query, key) * sm_scale
+        if USE_SMALL_K and BLOCK_N == 1:
+            key_vec = tl.sum(key.to(tl.float32), axis=1)
+            score_vec = tl.sum(
+                query.to(tl.float32) * tl.expand_dims(key_vec, 0),
+                axis=1,
+            ) * sm_scale
+            scores = tl.expand_dims(score_vec, 1)
+        else:
+            scores = tl.dot(query, key) * sm_scale
         attn_mask = (
             q_mask[:, None]
             & token_valid[None, :]
@@ -356,9 +471,19 @@ def _sparse_prefill_attention_contiguous_kernel(
             other=0.0,
         )
 
+        if USE_SMALL_K:
+            value_acc = _smallk_weighted_value_sum(
+                probs,
+                value,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+            )
+        else:
+            value_acc = tl.dot(probs.to(value.dtype), value)
         running_out = (
             running_out * prev_scale[:, None]
-            + tl.dot(probs.to(value.dtype), value) * block_scale[:, None]
+            + value_acc * block_scale[:, None]
         )
         running_denom = (
             running_denom * prev_scale
@@ -420,6 +545,7 @@ def _sparse_prefill_attention_paged_kernel(
     TOPK: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     HEAD_SIZE_PADDED: tl.constexpr,
+    USE_SMALL_K: tl.constexpr,
 ):
     q_block_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -483,7 +609,15 @@ def _sparse_prefill_attention_paged_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(query, key) * sm_scale
+        if USE_SMALL_K and BLOCK_N == 1:
+            key_vec = tl.sum(key.to(tl.float32), axis=1)
+            score_vec = tl.sum(
+                query.to(tl.float32) * tl.expand_dims(key_vec, 0),
+                axis=1,
+            ) * sm_scale
+            scores = tl.expand_dims(score_vec, 1)
+        else:
+            scores = tl.dot(query, key) * sm_scale
         attn_mask = (
             q_mask[:, None]
             & token_valid[None, :]
@@ -527,9 +661,19 @@ def _sparse_prefill_attention_paged_kernel(
             other=0.0,
         )
 
+        if USE_SMALL_K:
+            value_acc = _smallk_weighted_value_sum(
+                probs,
+                value,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+            )
+        else:
+            value_acc = tl.dot(probs.to(value.dtype), value)
         running_out = (
             running_out * prev_scale[:, None]
-            + tl.dot(probs.to(value.dtype), value) * block_scale[:, None]
+            + value_acc * block_scale[:, None]
         )
         running_denom = (
             running_denom * prev_scale
@@ -566,6 +710,7 @@ def _launch_contiguous_sparse_attention(
     )
     block_m = triton.next_power_of_2(int(cfg.q_block))
     block_n = triton.next_power_of_2(int(cfg.k_block))
+    use_small_k = block_n < 16
     head_size = int(query.shape[-1])
     head_size_padded = triton.next_power_of_2(head_size)
     num_queries_per_kv = query.shape[1] // key.shape[1]
@@ -607,9 +752,17 @@ def _launch_contiguous_sparse_attention(
         TOPK=int(cfg.topk),
         HEAD_SIZE=head_size,
         HEAD_SIZE_PADDED=head_size_padded,
+        USE_SMALL_K=use_small_k,
         num_warps=num_warps,
         num_stages=1,
     )
+    if int(cfg.k_block) == 1:
+        output = _apply_k1_reference_fallback(
+            output=output,
+            value_mean=value.to(torch.float32).mean(dim=0),
+            topk_metadata=topk_metadata,
+            q_block=int(cfg.q_block),
+        )
     return output
 
 
@@ -637,6 +790,7 @@ def _launch_paged_sparse_attention(
     block_table_row = block_table_row.to(device=query.device, dtype=torch.int32).contiguous()
     block_m = triton.next_power_of_2(int(cfg.q_block))
     block_n = triton.next_power_of_2(int(cfg.k_block))
+    use_small_k = block_n < 16
     head_size = int(query.shape[-1])
     head_size_padded = triton.next_power_of_2(head_size)
     num_queries_per_kv = query.shape[1] // key_cache.shape[2]
@@ -682,9 +836,21 @@ def _launch_paged_sparse_attention(
         TOPK=int(cfg.topk),
         HEAD_SIZE=head_size,
         HEAD_SIZE_PADDED=head_size_padded,
+        USE_SMALL_K=use_small_k,
         num_warps=num_warps,
         num_stages=1,
     )
+    if int(cfg.k_block) == 1:
+        output = _apply_k1_reference_fallback(
+            output=output,
+            value_mean=_gather_paged_value_mean(
+                value_cache=value_cache,
+                block_table_row=block_table_row,
+                seq_len=seq_len,
+            ),
+            topk_metadata=topk_metadata,
+            q_block=int(cfg.q_block),
+        )
     return output
 
 

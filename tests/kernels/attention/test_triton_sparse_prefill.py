@@ -18,12 +18,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_cfg(topk: int = 4) -> SparsePrefillTopKConfig:
+def _make_cfg(*, topk: int = 4, q_block: int = 16, k_block: int = 16) -> SparsePrefillTopKConfig:
     return SparsePrefillTopKConfig(
         key="test_sparse",
         name="test_sparse",
-        q_block=16,
-        k_block=16,
+        q_block=q_block,
+        k_block=k_block,
         topk=topk,
     )
 
@@ -55,15 +55,17 @@ def _build_paged_kv_cache(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_kv_heads", [8, 2])
+@pytest.mark.parametrize("k_block", [1, 4, 8, 16])
 def test_triton_sparse_prefill_matches_pytorch_full_prefill(
     dtype: torch.dtype,
     num_kv_heads: int,
+    k_block: int,
 ):
     torch.manual_seed(0)
-    q_len = 128
+    q_len = 130
     num_heads = 8
     head_dim = 64
-    cfg = _make_cfg(topk=4)
+    cfg = _make_cfg(topk=4, k_block=k_block)
     scale = 1.0 / math.sqrt(head_dim)
 
     query = torch.randn(q_len, num_heads, head_dim, device="cuda", dtype=dtype)
@@ -93,15 +95,19 @@ def test_triton_sparse_prefill_matches_pytorch_full_prefill(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_triton_sparse_prefill_matches_pytorch_cached_prefix(dtype: torch.dtype):
+@pytest.mark.parametrize("k_block", [1, 4, 8, 16])
+def test_triton_sparse_prefill_matches_pytorch_cached_prefix(
+    dtype: torch.dtype,
+    k_block: int,
+):
     torch.manual_seed(1)
-    seq_len = 96
-    query_len = 32
+    seq_len = 97
+    query_len = 33
     num_heads = 8
     num_kv_heads = 2
     head_dim = 64
     cache_block_size = 16
-    cfg = _make_cfg(topk=4)
+    cfg = _make_cfg(topk=4, k_block=k_block)
     scale = 1.0 / math.sqrt(head_dim)
 
     query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
@@ -110,7 +116,7 @@ def test_triton_sparse_prefill_matches_pytorch_cached_prefix(dtype: torch.dtype)
         seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype
     )
     block_table_row = torch.tensor(
-        [3, 0, 5, 1, 4, 2],
+        [3, 0, 5, 1, 6, 4, 2],
         device="cuda",
         dtype=torch.int32,
     )
@@ -154,7 +160,7 @@ def test_triton_sparse_prefill_benchmark_smoke():
     num_kv_heads = 4
     head_dim = 64
     cache_block_size = 16
-    cfg = _make_cfg(topk=16)
+    cfg = _make_cfg(topk=16, k_block=1)
     scale = 1.0 / math.sqrt(head_dim)
 
     query = torch.randn(
