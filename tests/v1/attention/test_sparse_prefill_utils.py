@@ -14,13 +14,19 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_SPARSE_RUNTIME_KEY_ENV,
     AUTOPTQ_VLLM_SPARSE_ENABLE_ENV,
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
+    AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
+    SparsePrefillTopKConfig,
     _reconstruct_sequence_slots,
     gather_full_sequence_kv_from_paged_cache,
     get_sparse_prefill_impl_mode,
     get_sparse_prefill_topk_config,
+    is_sparse_prefill_retain_score_recording_enabled,
     is_cached_prefix_prefill_request,
     is_full_prefill_request,
     is_sparse_prefill_request,
+)
+from vllm.v1.attention.ops.triton_sparse_prefill import (
+    build_sparse_topk_block_metadata,
 )
 
 
@@ -62,6 +68,24 @@ def test_get_sparse_prefill_impl_mode_rejects_invalid_values(monkeypatch):
         get_sparse_prefill_impl_mode()
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        ("1", True),
+        ("true", True),
+        ("On", True),
+        ("0", False),
+        ("", False),
+    ],
+)
+def test_sparse_prefill_retain_score_switch_parses_flags(
+    monkeypatch, env_value: str, expected: bool
+):
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV, env_value)
+
+    assert is_sparse_prefill_retain_score_recording_enabled() is expected
+
+
 def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path):
     sparse_json = tmp_path / "sparse.json"
     sparse_json.write_text(
@@ -88,6 +112,40 @@ def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path
     assert cfg.q_block == 16
     assert cfg.k_block == 16
     assert cfg.topk == 128
+
+
+def test_build_sparse_topk_block_metadata_records_retained_attention_score():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=2,
+        topk=1,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor([[[[0.0], [1.0], [2.0]]]], dtype=torch.float32)
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=2.0,
+        cfg=cfg,
+        k_len=6,
+        record_selection_stats=True,
+    )
+
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_valid_blocks == 5
+    assert metadata.selection_stats.total_kept_blocks == 2
+    assert metadata.selection_stats.total_valid_rows == 2
+
+    row0 = torch.softmax(torch.tensor([0.0, 2.0]), dim=0)[-1]
+    row1 = torch.softmax(torch.tensor([0.0, 2.0, 4.0]), dim=0)[-1]
+    expected_mean = float((row0 + row1) / 2)
+    assert metadata.selection_stats.retained_attention_score_mean == pytest.approx(
+        expected_mean,
+        rel=1e-6,
+    )
 
 
 def test_sparse_output_nan_check_accepts_finite_output():

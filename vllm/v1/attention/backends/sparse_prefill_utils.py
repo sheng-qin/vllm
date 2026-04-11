@@ -13,12 +13,19 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from vllm.logger import init_logger
+
 AUTOPTQ_VLLM_SPARSE_ENABLE_ENV = "AUTOPTQ_VLLM_SPARSE_ENABLE"
 AUTOPTQ_SPARSE_RUNTIME_JSON_ENV = "AUTOPTQ_SPARSE_RUNTIME_JSON"
 AUTOPTQ_SPARSE_RUNTIME_KEY_ENV = "AUTOPTQ_SPARSE_RUNTIME_KEY"
 AUTOPTQ_VLLM_SPARSE_IMPL_ENV = "AUTOPTQ_VLLM_SPARSE_IMPL"
+AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV = (
+    "AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE"
+)
 
 DEFAULT_PV_BLOCK_SIZE = 128
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,26 @@ class SparsePrefillTopKConfig:
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
 
 
+@dataclass(frozen=True)
+class SparsePrefillSelectionStats:
+    total_valid_blocks: int
+    total_kept_blocks: int
+    total_valid_rows: int
+    retained_attention_score_sum: float
+
+    @property
+    def density(self) -> float:
+        if self.total_valid_blocks <= 0:
+            return 0.0
+        return float(self.total_kept_blocks / self.total_valid_blocks)
+
+    @property
+    def retained_attention_score_mean(self) -> float:
+        if self.total_valid_rows <= 0:
+            return 0.0
+        return float(self.retained_attention_score_sum / self.total_valid_rows)
+
+
 def _parse_env_flag(value: str | None) -> bool:
     if value is None:
         return False
@@ -39,6 +66,10 @@ def _parse_env_flag(value: str | None) -> bool:
 
 def is_sparse_prefill_enabled() -> bool:
     return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV))
+
+
+def is_sparse_prefill_retain_score_recording_enabled() -> bool:
+    return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV))
 
 
 def get_sparse_prefill_impl_mode() -> str:
@@ -381,6 +412,40 @@ def _expand_sparse_block_mask_to_token_mask(
     return token_mask[:, :, :q_len, :k_len]
 
 
+def _summarize_sparse_block_selection(
+    block_probs: torch.Tensor,
+    valid_block_mask: torch.Tensor,
+    keep_block_mask: torch.Tensor,
+) -> SparsePrefillSelectionStats:
+    valid_block_counts = valid_block_mask.sum(dim=-1).to(torch.int32)
+    kept_block_counts = keep_block_mask.sum(dim=-1).to(torch.int32)
+    valid_row_mask = valid_block_counts > 0
+
+    retained_attention_score_mass = torch.where(
+        keep_block_mask,
+        block_probs,
+        torch.zeros_like(block_probs),
+    ).sum(dim=-1)
+    retained_attention_score_mass = torch.where(
+        valid_row_mask,
+        retained_attention_score_mass,
+        torch.zeros_like(retained_attention_score_mass),
+    )
+
+    total_valid_rows = int(valid_row_mask.sum().item())
+    retained_sum = (
+        float(retained_attention_score_mass.sum().item())
+        if total_valid_rows > 0
+        else 0.0
+    )
+    return SparsePrefillSelectionStats(
+        total_valid_blocks=int(valid_block_counts.sum().item()),
+        total_kept_blocks=int(kept_block_counts.sum().item()),
+        total_valid_rows=total_valid_rows,
+        retained_attention_score_sum=retained_sum,
+    )
+
+
 def _build_sparse_attention_mask_topk(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -388,7 +453,8 @@ def _build_sparse_attention_mask_topk(
     *,
     scaling: float,
     cfg: SparsePrefillTopKConfig,
-) -> torch.Tensor:
+    return_selection_stats: bool = False,
+) -> tuple[torch.Tensor, SparsePrefillSelectionStats | None]:
     batch_size, num_heads, q_len, _ = query.shape
     k_len = key.shape[-2]
     mask_dtype = attention_mask.dtype
@@ -434,11 +500,20 @@ def _build_sparse_attention_mask_topk(
         k_block=cfg.k_block,
     )
     keep_token_mask = keep_token_mask & allowed_token_mask
+    selection_stats = (
+        _summarize_sparse_block_selection(
+            block_probs,
+            valid_block_mask,
+            keep_block_mask,
+        )
+        if return_selection_stats
+        else None
+    )
     return torch.where(
         keep_token_mask,
         base_mask,
         torch.full_like(base_mask, torch.finfo(base_mask.dtype).min),
-    )
+    ), selection_stats
 
 
 def _online_softmax_attention_with_mask(
@@ -521,6 +596,7 @@ def run_sparse_prefill_attention(
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None = None,
+    record_retain_score: bool = False,
 ) -> torch.Tensor:
     """Run the prototype PyTorch sparse attention path for one prefill request.
 
@@ -552,13 +628,30 @@ def run_sparse_prefill_attention(
         key_states=key_states,
         target_dtype=query_states.dtype,
     )
-    sparse_mask = _build_sparse_attention_mask_topk(
+    sparse_mask, selection_stats = _build_sparse_attention_mask_topk(
         query_states,
         key_states,
         base_mask,
         scaling=scaling,
         cfg=cfg,
+        return_selection_stats=record_retain_score,
     )
+    if selection_stats is not None:
+        logger.info(
+            "Sparse prefill torch retain-score stats: q_len=%d k_len=%d "
+            "q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+            "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+            int(query.shape[0]),
+            int(key.shape[0]),
+            int(cfg.q_block),
+            int(cfg.k_block),
+            int(cfg.topk),
+            selection_stats.retained_attention_score_mean,
+            selection_stats.density,
+            selection_stats.total_valid_rows,
+            selection_stats.total_kept_blocks,
+            selection_stats.total_valid_blocks,
+        )
     output = _online_softmax_attention_with_mask(
         query_states,
         key_states,

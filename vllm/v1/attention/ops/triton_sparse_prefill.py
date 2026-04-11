@@ -7,12 +7,16 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import RCP_LN2
 from vllm.v1.attention.backends.sparse_prefill_utils import (
+    SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _mean_pool_attention_blocks,
 )
+
+logger = init_logger(__name__)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -37,6 +41,7 @@ class SparseTopKBlockMetadata:
     q_blocks: int
     k_blocks: int
     q_abs_offset: int
+    selection_stats: SparsePrefillSelectionStats | None = None
 
 
 def _extract_unquantized_paged_kv(
@@ -135,6 +140,48 @@ def _pad_topk_indices(
     return torch.where(invalid, torch.full_like(padded, -1), padded)
 
 
+def _summarize_topk_block_selection(
+    *,
+    masked_scores: torch.Tensor,
+    topk_values: torch.Tensor,
+    valid_block_mask: torch.Tensor,
+    counts: torch.Tensor,
+) -> SparsePrefillSelectionStats:
+    valid_block_counts = valid_block_mask.sum(dim=-1).to(torch.int32)
+    valid_row_mask = valid_block_counts > 0
+    safe_logsumexp = torch.logsumexp(masked_scores, dim=-1)
+    safe_logsumexp = torch.where(
+        valid_row_mask,
+        safe_logsumexp,
+        torch.zeros_like(safe_logsumexp),
+    )
+
+    rank = torch.arange(
+        topk_values.shape[-1],
+        device=topk_values.device,
+        dtype=counts.dtype,
+    ).view(*([1] * counts.dim()), topk_values.shape[-1])
+    keep_mask = rank < counts.unsqueeze(-1)
+    retained_attention_score_mass = torch.where(
+        keep_mask & valid_row_mask.unsqueeze(-1),
+        torch.exp(topk_values - safe_logsumexp.unsqueeze(-1)),
+        torch.zeros_like(topk_values),
+    ).sum(dim=-1)
+
+    total_valid_rows = int(valid_row_mask.sum().item())
+    retained_sum = (
+        float(retained_attention_score_mass.sum().item())
+        if total_valid_rows > 0
+        else 0.0
+    )
+    return SparsePrefillSelectionStats(
+        total_valid_blocks=int(valid_block_counts.sum().item()),
+        total_kept_blocks=int(counts.sum().item()),
+        total_valid_rows=total_valid_rows,
+        retained_attention_score_sum=retained_sum,
+    )
+
+
 def build_sparse_topk_block_metadata(
     *,
     query: torch.Tensor,
@@ -142,6 +189,7 @@ def build_sparse_topk_block_metadata(
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     k_len: int,
+    record_selection_stats: bool = False,
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
     pooled_query = _mean_pool_attention_blocks(query_states, cfg.q_block)
@@ -180,15 +228,27 @@ def build_sparse_topk_block_metadata(
         torch.full_like(block_scores, float("-inf")),
     )
     k_keep = min(int(cfg.topk), int(masked_scores.shape[-1]))
-    topk_idx = torch.topk(masked_scores, k=k_keep, dim=-1).indices
+    topk_result = torch.topk(masked_scores, k=k_keep, dim=-1)
+    topk_idx = topk_result.indices
     counts = valid_block_mask.sum(dim=-1).clamp_max(k_keep).to(torch.int32)
     padded_topk_idx = _pad_topk_indices(topk_idx, counts, full_topk=int(cfg.topk))
+    selection_stats = (
+        _summarize_topk_block_selection(
+            masked_scores=masked_scores,
+            topk_values=topk_result.values,
+            valid_block_mask=valid_block_mask,
+            counts=counts,
+        )
+        if record_selection_stats
+        else None
+    )
     return SparseTopKBlockMetadata(
         topk_block_indices=padded_topk_idx.squeeze(0).contiguous(),
         topk_block_counts=counts.squeeze(0).contiguous(),
         q_blocks=_ceil_div(query.shape[0], cfg.q_block),
         k_blocks=_ceil_div(k_len, cfg.k_block),
         q_abs_offset=k_len - query.shape[0],
+        selection_stats=selection_stats,
     )
 
 
@@ -198,8 +258,10 @@ def build_sparse_topk_block_metadata_from_paged_cache(
     kv_cache: torch.Tensor,
     block_table_row: torch.Tensor,
     seq_len: int,
+    scaling: float,
     kv_cache_dtype: str,
     cfg: SparsePrefillTopKConfig,
+    record_selection_stats: bool = False,
 ) -> SparseTopKBlockMetadata:
     key_cache, _ = _extract_unquantized_paged_kv(
         kv_cache,
@@ -214,9 +276,10 @@ def build_sparse_topk_block_metadata_from_paged_cache(
     return build_sparse_topk_block_metadata(
         query=query,
         pooled_key=pooled_key,
-        scaling=1.0,
+        scaling=scaling,
         cfg=cfg,
         k_len=seq_len,
+        record_selection_stats=record_selection_stats,
     )
 
 
@@ -854,6 +917,34 @@ def _launch_paged_sparse_attention(
     return output
 
 
+def _log_triton_retain_score_stats(
+    *,
+    query_len: int,
+    seq_len: int,
+    cfg: SparsePrefillTopKConfig,
+    paged_kv: bool,
+    selection_stats: SparsePrefillSelectionStats | None,
+) -> None:
+    if selection_stats is None:
+        return
+    logger.info(
+        "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
+        "path=%s q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+        "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+        int(query_len),
+        int(seq_len),
+        "paged" if paged_kv else "contiguous",
+        int(cfg.q_block),
+        int(cfg.k_block),
+        int(cfg.topk),
+        selection_stats.retained_attention_score_mean,
+        selection_stats.density,
+        selection_stats.total_valid_rows,
+        selection_stats.total_kept_blocks,
+        selection_stats.total_valid_blocks,
+    )
+
+
 def run_triton_sparse_prefill_attention(
     *,
     query: torch.Tensor,
@@ -866,6 +957,7 @@ def run_triton_sparse_prefill_attention(
     block_table_row: torch.Tensor | None = None,
     seq_len: int | None = None,
     kv_cache_dtype: str = "auto",
+    record_retain_score: bool = False,
 ) -> torch.Tensor:
     if not HAS_TRITON:
         raise RuntimeError("Triton is not available for sparse prefill attention.")
@@ -878,8 +970,17 @@ def run_triton_sparse_prefill_attention(
             kv_cache=kv_cache,
             block_table_row=block_table_row,
             seq_len=seq_len,
+            scaling=scaling,
             kv_cache_dtype=kv_cache_dtype,
             cfg=cfg,
+            record_selection_stats=record_retain_score,
+        )
+        _log_triton_retain_score_stats(
+            query_len=int(query.shape[0]),
+            seq_len=int(seq_len),
+            cfg=cfg,
+            paged_kv=True,
+            selection_stats=topk_metadata.selection_stats,
         )
         return _launch_paged_sparse_attention(
             query=query,
@@ -909,6 +1010,14 @@ def run_triton_sparse_prefill_attention(
         scaling=scaling,
         cfg=cfg,
         k_len=key.shape[0],
+        record_selection_stats=record_retain_score,
+    )
+    _log_triton_retain_score_stats(
+        query_len=int(query.shape[0]),
+        seq_len=int(key.shape[0]),
+        cfg=cfg,
+        paged_kv=False,
+        selection_stats=topk_metadata.selection_stats,
     )
     return _launch_contiguous_sparse_attention(
         query=query,
