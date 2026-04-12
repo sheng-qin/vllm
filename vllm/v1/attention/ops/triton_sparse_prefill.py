@@ -11,12 +11,16 @@ from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import RCP_LN2
 from vllm.v1.attention.backends.sparse_prefill_utils import (
+    SparsePrefillRetainScoreLogMode,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _mean_pool_attention_blocks,
     build_sparse_prefill_selection_stats,
     format_sparse_prefill_per_head_payload,
     resolve_sparse_prefill_layer_info,
+    resolve_sparse_prefill_retain_score_log_mode,
+    should_log_sparse_prefill_layer_info,
+    should_log_sparse_prefill_per_head_stats,
 )
 
 logger = init_logger(__name__)
@@ -922,50 +926,72 @@ def _log_triton_retain_score_stats(
     cfg: SparsePrefillTopKConfig,
     paged_kv: bool,
     selection_stats: SparsePrefillSelectionStats | None,
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode,
 ) -> None:
     if selection_stats is None:
         return
-    layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
-    per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
-    logger.info(
-        "Sparse prefill Triton retain-score stats: layer_idx=%s layer_name=%s "
-        "q_len=%d seq_len=%d path=%s q_block=%d k_block=%d topk=%d "
-        "avg_retain_score=%.6f density=%.6f valid_rows=%d "
-        "kept_blocks=%d valid_blocks=%d.",
-        layer_idx if layer_idx is not None else "NA",
-        layer_name or "unknown",
-        int(query_len),
-        int(seq_len),
-        "paged" if paged_kv else "contiguous",
-        int(cfg.q_block),
-        int(cfg.k_block),
-        int(cfg.topk),
-        selection_stats.retained_attention_score_mean,
-        selection_stats.density,
-        selection_stats.total_valid_rows,
-        selection_stats.total_kept_blocks,
-        selection_stats.total_valid_blocks,
-    )
-    logger.info(
-        "Sparse prefill Triton retain-score per-head stats: layer_idx=%s "
-        "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
-        "topk=%d num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
-        "kept_blocks=%s valid_blocks=%s.",
-        layer_idx if layer_idx is not None else "NA",
-        layer_name or "unknown",
-        int(query_len),
-        int(seq_len),
-        "paged" if paged_kv else "contiguous",
-        int(cfg.q_block),
-        int(cfg.k_block),
-        int(cfg.topk),
-        len(selection_stats.per_head_total_valid_rows),
-        per_head_payload["retain_scores"],
-        per_head_payload["densities"],
-        per_head_payload["valid_rows"],
-        per_head_payload["kept_blocks"],
-        per_head_payload["valid_blocks"],
-    )
+    layer_idx = None
+    layer_name = None
+    if should_log_sparse_prefill_layer_info(retain_score_log_mode):
+        layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+        logger.info(
+            "Sparse prefill Triton retain-score stats: layer_idx=%s "
+            "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
+            "topk=%d avg_retain_score=%.6f density=%.6f valid_rows=%d "
+            "kept_blocks=%d valid_blocks=%d.",
+            layer_idx if layer_idx is not None else "NA",
+            layer_name or "unknown",
+            int(query_len),
+            int(seq_len),
+            "paged" if paged_kv else "contiguous",
+            int(cfg.q_block),
+            int(cfg.k_block),
+            int(cfg.topk),
+            selection_stats.retained_attention_score_mean,
+            selection_stats.density,
+            selection_stats.total_valid_rows,
+            selection_stats.total_kept_blocks,
+            selection_stats.total_valid_blocks,
+        )
+    else:
+        logger.info(
+            "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
+            "path=%s q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+            "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+            int(query_len),
+            int(seq_len),
+            "paged" if paged_kv else "contiguous",
+            int(cfg.q_block),
+            int(cfg.k_block),
+            int(cfg.topk),
+            selection_stats.retained_attention_score_mean,
+            selection_stats.density,
+            selection_stats.total_valid_rows,
+            selection_stats.total_kept_blocks,
+            selection_stats.total_valid_blocks,
+        )
+    if should_log_sparse_prefill_per_head_stats(retain_score_log_mode):
+        per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
+        logger.info(
+            "Sparse prefill Triton retain-score per-head stats: layer_idx=%s "
+            "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
+            "topk=%d num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
+            "kept_blocks=%s valid_blocks=%s.",
+            layer_idx if layer_idx is not None else "NA",
+            layer_name or "unknown",
+            int(query_len),
+            int(seq_len),
+            "paged" if paged_kv else "contiguous",
+            int(cfg.q_block),
+            int(cfg.k_block),
+            int(cfg.topk),
+            len(selection_stats.per_head_total_valid_rows),
+            per_head_payload["retain_scores"],
+            per_head_payload["densities"],
+            per_head_payload["valid_rows"],
+            per_head_payload["kept_blocks"],
+            per_head_payload["valid_blocks"],
+        )
 
 
 def run_triton_sparse_prefill_attention(
@@ -981,12 +1007,17 @@ def run_triton_sparse_prefill_attention(
     seq_len: int | None = None,
     kv_cache_dtype: str = "auto",
     record_retain_score: bool = False,
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode | None = None,
     layer: object | None = None,
 ) -> torch.Tensor:
     if not HAS_TRITON:
         raise RuntimeError("Triton is not available for sparse prefill attention.")
     if query.device.type != "cuda":
         raise RuntimeError("Triton sparse prefill attention requires CUDA tensors.")
+    resolved_log_mode = resolve_sparse_prefill_retain_score_log_mode(
+        record_retain_score=record_retain_score,
+        retain_score_log_mode=retain_score_log_mode,
+    )
 
     if kv_cache is not None and block_table_row is not None and seq_len is not None:
         topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
@@ -997,7 +1028,7 @@ def run_triton_sparse_prefill_attention(
             scaling=scaling,
             kv_cache_dtype=kv_cache_dtype,
             cfg=cfg,
-            record_selection_stats=record_retain_score,
+            record_selection_stats=resolved_log_mode != "off",
         )
         _log_triton_retain_score_stats(
             layer=layer,
@@ -1006,6 +1037,7 @@ def run_triton_sparse_prefill_attention(
             cfg=cfg,
             paged_kv=True,
             selection_stats=topk_metadata.selection_stats,
+            retain_score_log_mode=resolved_log_mode,
         )
         return _launch_paged_sparse_attention(
             query=query,
@@ -1035,7 +1067,7 @@ def run_triton_sparse_prefill_attention(
         scaling=scaling,
         cfg=cfg,
         k_len=key.shape[0],
-        record_selection_stats=record_retain_score,
+        record_selection_stats=resolved_log_mode != "off",
     )
     _log_triton_retain_score_stats(
         layer=layer,
@@ -1044,6 +1076,7 @@ def run_triton_sparse_prefill_attention(
         cfg=cfg,
         paged_kv=False,
         selection_stats=topk_metadata.selection_stats,
+        retain_score_log_mode=resolved_log_mode,
     )
     return _launch_contiguous_sparse_attention(
         query=query,

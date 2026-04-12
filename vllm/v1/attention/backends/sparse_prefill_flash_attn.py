@@ -21,7 +21,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     gather_full_sequence_kv_from_paged_cache,
     get_sparse_prefill_topk_config,
     get_sparse_prefill_impl_mode,
-    is_sparse_prefill_retain_score_recording_enabled,
+    get_sparse_prefill_retain_score_log_mode,
     is_cached_prefix_prefill_request,
     is_full_prefill_request,
     is_sparse_prefill_request,
@@ -193,7 +193,8 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
             )
         self.sparse_cfg: SparsePrefillTopKConfig = cfg
         self.sparse_impl_mode = get_sparse_prefill_impl_mode()
-        self.record_retain_score = is_sparse_prefill_retain_score_recording_enabled()
+        self.retain_score_log_mode = get_sparse_prefill_retain_score_log_mode()
+        self.record_retain_score = self.retain_score_log_mode != "off"
         logger.info_once(
             "Sparse prefill FlashAttention backend enabled with scheme %s "
             "(q_block=%d, k_block=%d, topk=%d, impl=%s). Eligible prefill "
@@ -208,8 +209,9 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
         )
         if self.record_retain_score:
             logger.info_once(
-                "Sparse prefill FlashAttention will log average retain score "
-                "for sparse requests because %s is enabled.",
+                "Sparse prefill FlashAttention will log retain score stats "
+                "with mode=%s for sparse requests because %s is enabled.",
+                self.retain_score_log_mode,
                 AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
                 scope="local",
             )
@@ -424,6 +426,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             cfg=self.sparse_cfg,
                             output_dtype=output.dtype,
                             record_retain_score=self.record_retain_score,
+                            retain_score_log_mode=self.retain_score_log_mode,
                             layer=layer,
                         )
                     elif block_table is not None and block_table.numel() > 0:
@@ -437,6 +440,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             seq_len=seq_len,
                             kv_cache_dtype=self.kv_cache_dtype,
                             record_retain_score=self.record_retain_score,
+                            retain_score_log_mode=self.retain_score_log_mode,
                             layer=layer,
                         )
                     if sparse_output is not None:
@@ -580,6 +584,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                     cfg=self.sparse_cfg,
                     output_dtype=output.dtype,
                     record_retain_score=self.record_retain_score,
+                    retain_score_log_mode=self.retain_score_log_mode,
                     layer=layer,
                 )
                 _ensure_sparse_output_has_no_nan(

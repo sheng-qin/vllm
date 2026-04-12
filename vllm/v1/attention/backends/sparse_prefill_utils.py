@@ -9,6 +9,7 @@ import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,7 @@ AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV = (
 )
 
 DEFAULT_PV_BLOCK_SIZE = 128
+SparsePrefillRetainScoreLogMode = Literal["off", "summary", "layer", "head"]
 
 logger = init_logger(__name__)
 
@@ -183,6 +185,34 @@ def resolve_sparse_prefill_layer_info(
     return layer_idx, layer_name
 
 
+def _parse_sparse_prefill_retain_score_log_mode(
+    value: str | None,
+) -> SparsePrefillRetainScoreLogMode:
+    if value is None or not value.strip():
+        return "off"
+
+    normalized = value.strip().lower()
+    mode_map: dict[str, SparsePrefillRetainScoreLogMode] = {
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "off": "off",
+        "1": "head",
+        "true": "head",
+        "yes": "head",
+        "on": "head",
+        "summary": "summary",
+        "layer": "layer",
+        "head": "head",
+    }
+    if normalized not in mode_map:
+        raise ValueError(
+            f"{AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV} must be one of "
+            "'0', '1', 'summary', 'layer', or 'head'."
+        )
+    return mode_map[normalized]
+
+
 def _parse_env_flag(value: str | None) -> bool:
     if value is None:
         return False
@@ -193,8 +223,36 @@ def is_sparse_prefill_enabled() -> bool:
     return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV))
 
 
+def get_sparse_prefill_retain_score_log_mode() -> SparsePrefillRetainScoreLogMode:
+    return _parse_sparse_prefill_retain_score_log_mode(
+        os.getenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV)
+    )
+
+
 def is_sparse_prefill_retain_score_recording_enabled() -> bool:
-    return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV))
+    return get_sparse_prefill_retain_score_log_mode() != "off"
+
+
+def resolve_sparse_prefill_retain_score_log_mode(
+    *,
+    record_retain_score: bool,
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode | None,
+) -> SparsePrefillRetainScoreLogMode:
+    if retain_score_log_mode is not None:
+        return retain_score_log_mode
+    return "head" if record_retain_score else "off"
+
+
+def should_log_sparse_prefill_layer_info(
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode,
+) -> bool:
+    return retain_score_log_mode in {"layer", "head"}
+
+
+def should_log_sparse_prefill_per_head_stats(
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode,
+) -> bool:
+    return retain_score_log_mode == "head"
 
 
 def get_sparse_prefill_impl_mode() -> str:
@@ -716,6 +774,7 @@ def run_sparse_prefill_attention(
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None = None,
     record_retain_score: bool = False,
+    retain_score_log_mode: SparsePrefillRetainScoreLogMode | None = None,
     layer: object | None = None,
 ) -> torch.Tensor:
     """Run the prototype PyTorch sparse attention path for one prefill request.
@@ -748,54 +807,78 @@ def run_sparse_prefill_attention(
         key_states=key_states,
         target_dtype=query_states.dtype,
     )
+    resolved_log_mode = resolve_sparse_prefill_retain_score_log_mode(
+        record_retain_score=record_retain_score,
+        retain_score_log_mode=retain_score_log_mode,
+    )
     sparse_mask, selection_stats = _build_sparse_attention_mask_topk(
         query_states,
         key_states,
         base_mask,
         scaling=scaling,
         cfg=cfg,
-        return_selection_stats=record_retain_score,
+        return_selection_stats=resolved_log_mode != "off",
     )
     if selection_stats is not None:
-        layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
-        per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
-        logger.info(
-            "Sparse prefill torch retain-score stats: layer_idx=%s "
-            "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
-            "avg_retain_score=%.6f density=%.6f valid_rows=%d "
-            "kept_blocks=%d valid_blocks=%d.",
-            layer_idx if layer_idx is not None else "NA",
-            layer_name or "unknown",
-            int(query.shape[0]),
-            int(key.shape[0]),
-            int(cfg.q_block),
-            int(cfg.k_block),
-            int(cfg.topk),
-            selection_stats.retained_attention_score_mean,
-            selection_stats.density,
-            selection_stats.total_valid_rows,
-            selection_stats.total_kept_blocks,
-            selection_stats.total_valid_blocks,
-        )
-        logger.info(
-            "Sparse prefill torch retain-score per-head stats: layer_idx=%s "
-            "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
-            "num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
-            "kept_blocks=%s valid_blocks=%s.",
-            layer_idx if layer_idx is not None else "NA",
-            layer_name or "unknown",
-            int(query.shape[0]),
-            int(key.shape[0]),
-            int(cfg.q_block),
-            int(cfg.k_block),
-            int(cfg.topk),
-            len(selection_stats.per_head_total_valid_rows),
-            per_head_payload["retain_scores"],
-            per_head_payload["densities"],
-            per_head_payload["valid_rows"],
-            per_head_payload["kept_blocks"],
-            per_head_payload["valid_blocks"],
-        )
+        layer_idx = None
+        layer_name = None
+        if should_log_sparse_prefill_layer_info(resolved_log_mode):
+            layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+            logger.info(
+                "Sparse prefill torch retain-score stats: layer_idx=%s "
+                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+                "avg_retain_score=%.6f density=%.6f valid_rows=%d "
+                "kept_blocks=%d valid_blocks=%d.",
+                layer_idx if layer_idx is not None else "NA",
+                layer_name or "unknown",
+                int(query.shape[0]),
+                int(key.shape[0]),
+                int(cfg.q_block),
+                int(cfg.k_block),
+                int(cfg.topk),
+                selection_stats.retained_attention_score_mean,
+                selection_stats.density,
+                selection_stats.total_valid_rows,
+                selection_stats.total_kept_blocks,
+                selection_stats.total_valid_blocks,
+            )
+        else:
+            logger.info(
+                "Sparse prefill torch retain-score stats: q_len=%d k_len=%d "
+                "q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+                "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+                int(query.shape[0]),
+                int(key.shape[0]),
+                int(cfg.q_block),
+                int(cfg.k_block),
+                int(cfg.topk),
+                selection_stats.retained_attention_score_mean,
+                selection_stats.density,
+                selection_stats.total_valid_rows,
+                selection_stats.total_kept_blocks,
+                selection_stats.total_valid_blocks,
+            )
+        if should_log_sparse_prefill_per_head_stats(resolved_log_mode):
+            per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
+            logger.info(
+                "Sparse prefill torch retain-score per-head stats: layer_idx=%s "
+                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+                "num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
+                "kept_blocks=%s valid_blocks=%s.",
+                layer_idx if layer_idx is not None else "NA",
+                layer_name or "unknown",
+                int(query.shape[0]),
+                int(key.shape[0]),
+                int(cfg.q_block),
+                int(cfg.k_block),
+                int(cfg.topk),
+                len(selection_stats.per_head_total_valid_rows),
+                per_head_payload["retain_scores"],
+                per_head_payload["densities"],
+                per_head_payload["valid_rows"],
+                per_head_payload["kept_blocks"],
+                per_head_payload["valid_blocks"],
+            )
     output = _online_softmax_attention_with_mask(
         query_states,
         key_states,

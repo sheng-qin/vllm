@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     _reconstruct_sequence_slots,
     gather_full_sequence_kv_from_paged_cache,
     get_sparse_prefill_impl_mode,
+    get_sparse_prefill_retain_score_log_mode,
     get_sparse_prefill_topk_config,
     is_sparse_prefill_retain_score_recording_enabled,
     is_cached_prefix_prefill_request,
@@ -73,21 +74,39 @@ def test_get_sparse_prefill_impl_mode_rejects_invalid_values(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("env_value", "expected"),
+    ("env_value", "expected_enabled", "expected_mode"),
     [
-        ("1", True),
-        ("true", True),
-        ("On", True),
-        ("0", False),
-        ("", False),
+        ("1", True, "head"),
+        ("true", True, "head"),
+        ("On", True, "head"),
+        ("summary", True, "summary"),
+        ("layer", True, "layer"),
+        ("head", True, "head"),
+        ("0", False, "off"),
+        ("", False, "off"),
     ],
 )
-def test_sparse_prefill_retain_score_switch_parses_flags(
-    monkeypatch, env_value: str, expected: bool
+def test_sparse_prefill_retain_score_switch_parses_modes(
+    monkeypatch, env_value: str, expected_enabled: bool, expected_mode: str
 ):
     monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV, env_value)
 
-    assert is_sparse_prefill_retain_score_recording_enabled() is expected
+    assert get_sparse_prefill_retain_score_log_mode() == expected_mode
+    assert is_sparse_prefill_retain_score_recording_enabled() is expected_enabled
+
+
+def test_sparse_prefill_retain_score_switch_defaults_to_off(monkeypatch):
+    monkeypatch.delenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV, raising=False)
+
+    assert get_sparse_prefill_retain_score_log_mode() == "off"
+    assert not is_sparse_prefill_retain_score_recording_enabled()
+
+
+def test_sparse_prefill_retain_score_switch_rejects_invalid_mode(monkeypatch):
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV, "per_layer")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        get_sparse_prefill_retain_score_log_mode()
 
 
 def test_resolve_sparse_prefill_layer_info_extracts_layer_name_and_index():
@@ -218,7 +237,21 @@ def test_build_sparse_topk_block_metadata_records_per_head_retained_attention_sc
     )
 
 
-def test_run_sparse_prefill_attention_logs_layer_aware_retain_score(monkeypatch):
+@pytest.mark.parametrize(
+    ("retain_score_log_mode", "expect_layer", "expect_per_head"),
+    [
+        ("summary", False, False),
+        ("layer", True, False),
+        ("head", True, True),
+        (None, True, True),
+    ],
+)
+def test_run_sparse_prefill_attention_logs_retain_score_by_mode(
+    monkeypatch,
+    retain_score_log_mode: str | None,
+    expect_layer: bool,
+    expect_per_head: bool,
+):
     cfg = SparsePrefillTopKConfig(
         key="test_sparse",
         name="test_sparse",
@@ -246,19 +279,40 @@ def test_run_sparse_prefill_attention_logs_layer_aware_retain_score(monkeypatch)
         cfg=cfg,
         output_dtype=torch.float32,
         record_retain_score=True,
+        retain_score_log_mode=retain_score_log_mode,
         layer=layer,
     )
 
-    assert any(
-        "layer_idx=3 layer_name=model.layers.3.self_attn.attn" in message
+    summary_messages = [
+        message
         for message in logged
-    )
-    assert any(
-        "retain_scores=[0.940399]" in message
-        and "densities=[0.666667]" in message
-        and "valid_rows=[2]" in message
+        if message.startswith("Sparse prefill torch retain-score stats:")
+    ]
+    per_head_messages = [
+        message
         for message in logged
-    )
+        if message.startswith("Sparse prefill torch retain-score per-head stats:")
+    ]
+
+    assert len(summary_messages) == 1
+    if expect_layer:
+        assert (
+            "layer_idx=3 layer_name=model.layers.3.self_attn.attn"
+            in summary_messages[0]
+        )
+    else:
+        assert "layer_idx=" not in summary_messages[0]
+        assert "layer_name=" not in summary_messages[0]
+
+    if expect_per_head:
+        assert len(per_head_messages) == 1
+        assert (
+            "retain_scores=[0.940399]" in per_head_messages[0]
+            and "densities=[0.666667]" in per_head_messages[0]
+            and "valid_rows=[2]" in per_head_messages[0]
+        )
+    else:
+        assert not per_head_messages
 
 
 def test_sparse_output_nan_check_accepts_finite_output():
