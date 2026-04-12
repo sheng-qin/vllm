@@ -14,6 +14,9 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _mean_pool_attention_blocks,
+    build_sparse_prefill_selection_stats,
+    format_sparse_prefill_per_head_payload,
+    resolve_sparse_prefill_layer_info,
 )
 
 logger = init_logger(__name__)
@@ -168,17 +171,11 @@ def _summarize_topk_block_selection(
         torch.zeros_like(topk_values),
     ).sum(dim=-1)
 
-    total_valid_rows = int(valid_row_mask.sum().item())
-    retained_sum = (
-        float(retained_attention_score_mass.sum().item())
-        if total_valid_rows > 0
-        else 0.0
-    )
-    return SparsePrefillSelectionStats(
-        total_valid_blocks=int(valid_block_counts.sum().item()),
-        total_kept_blocks=int(counts.sum().item()),
-        total_valid_rows=total_valid_rows,
-        retained_attention_score_sum=retained_sum,
+    return build_sparse_prefill_selection_stats(
+        valid_block_counts=valid_block_counts,
+        kept_block_counts=counts,
+        valid_row_mask=valid_row_mask,
+        retained_attention_score_mass=retained_attention_score_mass,
     )
 
 
@@ -919,6 +916,7 @@ def _launch_paged_sparse_attention(
 
 def _log_triton_retain_score_stats(
     *,
+    layer: object | None,
     query_len: int,
     seq_len: int,
     cfg: SparsePrefillTopKConfig,
@@ -927,10 +925,15 @@ def _log_triton_retain_score_stats(
 ) -> None:
     if selection_stats is None:
         return
+    layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+    per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
     logger.info(
-        "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
-        "path=%s q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
-        "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+        "Sparse prefill Triton retain-score stats: layer_idx=%s layer_name=%s "
+        "q_len=%d seq_len=%d path=%s q_block=%d k_block=%d topk=%d "
+        "avg_retain_score=%.6f density=%.6f valid_rows=%d "
+        "kept_blocks=%d valid_blocks=%d.",
+        layer_idx if layer_idx is not None else "NA",
+        layer_name or "unknown",
         int(query_len),
         int(seq_len),
         "paged" if paged_kv else "contiguous",
@@ -942,6 +945,26 @@ def _log_triton_retain_score_stats(
         selection_stats.total_valid_rows,
         selection_stats.total_kept_blocks,
         selection_stats.total_valid_blocks,
+    )
+    logger.info(
+        "Sparse prefill Triton retain-score per-head stats: layer_idx=%s "
+        "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
+        "topk=%d num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
+        "kept_blocks=%s valid_blocks=%s.",
+        layer_idx if layer_idx is not None else "NA",
+        layer_name or "unknown",
+        int(query_len),
+        int(seq_len),
+        "paged" if paged_kv else "contiguous",
+        int(cfg.q_block),
+        int(cfg.k_block),
+        int(cfg.topk),
+        len(selection_stats.per_head_total_valid_rows),
+        per_head_payload["retain_scores"],
+        per_head_payload["densities"],
+        per_head_payload["valid_rows"],
+        per_head_payload["kept_blocks"],
+        per_head_payload["valid_blocks"],
     )
 
 
@@ -958,6 +981,7 @@ def run_triton_sparse_prefill_attention(
     seq_len: int | None = None,
     kv_cache_dtype: str = "auto",
     record_retain_score: bool = False,
+    layer: object | None = None,
 ) -> torch.Tensor:
     if not HAS_TRITON:
         raise RuntimeError("Triton is not available for sparse prefill attention.")
@@ -976,6 +1000,7 @@ def run_triton_sparse_prefill_attention(
             record_selection_stats=record_retain_score,
         )
         _log_triton_retain_score_stats(
+            layer=layer,
             query_len=int(query.shape[0]),
             seq_len=int(seq_len),
             cfg=cfg,
@@ -1013,6 +1038,7 @@ def run_triton_sparse_prefill_attention(
         record_selection_stats=record_retain_score,
     )
     _log_triton_retain_score_stats(
+        layer=layer,
         query_len=int(query.shape[0]),
         seq_len=int(key.shape[0]),
         cfg=cfg,

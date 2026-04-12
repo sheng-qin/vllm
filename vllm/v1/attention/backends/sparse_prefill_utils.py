@@ -44,6 +44,10 @@ class SparsePrefillSelectionStats:
     total_kept_blocks: int
     total_valid_rows: int
     retained_attention_score_sum: float
+    per_head_total_valid_blocks: tuple[int, ...] = ()
+    per_head_total_kept_blocks: tuple[int, ...] = ()
+    per_head_total_valid_rows: tuple[int, ...] = ()
+    per_head_retained_attention_score_sum: tuple[float, ...] = ()
 
     @property
     def density(self) -> float:
@@ -56,6 +60,127 @@ class SparsePrefillSelectionStats:
         if self.total_valid_rows <= 0:
             return 0.0
         return float(self.retained_attention_score_sum / self.total_valid_rows)
+
+    @property
+    def per_head_density(self) -> tuple[float, ...]:
+        return tuple(
+            0.0
+            if valid_blocks <= 0
+            else float(kept_blocks / valid_blocks)
+            for kept_blocks, valid_blocks in zip(
+                self.per_head_total_kept_blocks,
+                self.per_head_total_valid_blocks,
+            )
+        )
+
+    @property
+    def per_head_retained_attention_score_mean(self) -> tuple[float, ...]:
+        return tuple(
+            0.0
+            if valid_rows <= 0
+            else float(retained_sum / valid_rows)
+            for retained_sum, valid_rows in zip(
+                self.per_head_retained_attention_score_sum,
+                self.per_head_total_valid_rows,
+            )
+        )
+
+
+def _collapse_per_head_counts(values: torch.Tensor) -> tuple[int, ...]:
+    head_dim = 1 if values.dim() > 1 else 0
+    reduce_dims = tuple(dim for dim in range(values.dim()) if dim != head_dim)
+    per_head = values.to(torch.int64)
+    if reduce_dims:
+        per_head = per_head.sum(dim=reduce_dims)
+    return tuple(int(v) for v in per_head.reshape(-1).tolist())
+
+
+def _collapse_per_head_floats(values: torch.Tensor) -> tuple[float, ...]:
+    head_dim = 1 if values.dim() > 1 else 0
+    reduce_dims = tuple(dim for dim in range(values.dim()) if dim != head_dim)
+    per_head = values.to(torch.float64)
+    if reduce_dims:
+        per_head = per_head.sum(dim=reduce_dims)
+    return tuple(float(v) for v in per_head.reshape(-1).tolist())
+
+
+def build_sparse_prefill_selection_stats(
+    *,
+    valid_block_counts: torch.Tensor,
+    kept_block_counts: torch.Tensor,
+    valid_row_mask: torch.Tensor,
+    retained_attention_score_mass: torch.Tensor,
+) -> SparsePrefillSelectionStats:
+    total_valid_rows = int(valid_row_mask.sum().item())
+    retained_sum = (
+        float(retained_attention_score_mass.sum().item())
+        if total_valid_rows > 0
+        else 0.0
+    )
+    return SparsePrefillSelectionStats(
+        total_valid_blocks=int(valid_block_counts.sum().item()),
+        total_kept_blocks=int(kept_block_counts.sum().item()),
+        total_valid_rows=total_valid_rows,
+        retained_attention_score_sum=retained_sum,
+        per_head_total_valid_blocks=_collapse_per_head_counts(valid_block_counts),
+        per_head_total_kept_blocks=_collapse_per_head_counts(kept_block_counts),
+        per_head_total_valid_rows=_collapse_per_head_counts(
+            valid_row_mask.to(torch.int32)
+        ),
+        per_head_retained_attention_score_sum=_collapse_per_head_floats(
+            retained_attention_score_mass
+        ),
+    )
+
+
+def format_sparse_prefill_per_head_payload(
+    selection_stats: SparsePrefillSelectionStats,
+) -> dict[str, str]:
+    return {
+        "retain_scores": json.dumps(
+            [
+                round(float(value), 6)
+                for value in selection_stats.per_head_retained_attention_score_mean
+            ],
+            separators=(",", ":"),
+        ),
+        "densities": json.dumps(
+            [round(float(value), 6) for value in selection_stats.per_head_density],
+            separators=(",", ":"),
+        ),
+        "valid_rows": json.dumps(
+            list(selection_stats.per_head_total_valid_rows),
+            separators=(",", ":"),
+        ),
+        "kept_blocks": json.dumps(
+            list(selection_stats.per_head_total_kept_blocks),
+            separators=(",", ":"),
+        ),
+        "valid_blocks": json.dumps(
+            list(selection_stats.per_head_total_valid_blocks),
+            separators=(",", ":"),
+        ),
+    }
+
+
+def resolve_sparse_prefill_layer_info(
+    layer: object | None,
+) -> tuple[int | None, str | None]:
+    layer_name = getattr(layer, "layer_name", None)
+    if layer_name is None:
+        return None, None
+
+    layer_name = str(layer_name).strip()
+    if not layer_name:
+        return None, None
+
+    try:
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_idx = extract_layer_index(layer_name)
+    except (AssertionError, ImportError, ValueError):
+        layer_idx = None
+    return layer_idx, layer_name
 
 
 def _parse_env_flag(value: str | None) -> bool:
@@ -432,17 +557,11 @@ def _summarize_sparse_block_selection(
         torch.zeros_like(retained_attention_score_mass),
     )
 
-    total_valid_rows = int(valid_row_mask.sum().item())
-    retained_sum = (
-        float(retained_attention_score_mass.sum().item())
-        if total_valid_rows > 0
-        else 0.0
-    )
-    return SparsePrefillSelectionStats(
-        total_valid_blocks=int(valid_block_counts.sum().item()),
-        total_kept_blocks=int(kept_block_counts.sum().item()),
-        total_valid_rows=total_valid_rows,
-        retained_attention_score_sum=retained_sum,
+    return build_sparse_prefill_selection_stats(
+        valid_block_counts=valid_block_counts,
+        kept_block_counts=kept_block_counts,
+        valid_row_mask=valid_row_mask,
+        retained_attention_score_mass=retained_attention_score_mass,
     )
 
 
@@ -597,6 +716,7 @@ def run_sparse_prefill_attention(
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None = None,
     record_retain_score: bool = False,
+    layer: object | None = None,
 ) -> torch.Tensor:
     """Run the prototype PyTorch sparse attention path for one prefill request.
 
@@ -637,10 +757,15 @@ def run_sparse_prefill_attention(
         return_selection_stats=record_retain_score,
     )
     if selection_stats is not None:
+        layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+        per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
         logger.info(
-            "Sparse prefill torch retain-score stats: q_len=%d k_len=%d "
-            "q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
-            "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
+            "Sparse prefill torch retain-score stats: layer_idx=%s "
+            "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+            "avg_retain_score=%.6f density=%.6f valid_rows=%d "
+            "kept_blocks=%d valid_blocks=%d.",
+            layer_idx if layer_idx is not None else "NA",
+            layer_name or "unknown",
             int(query.shape[0]),
             int(key.shape[0]),
             int(cfg.q_block),
@@ -651,6 +776,25 @@ def run_sparse_prefill_attention(
             selection_stats.total_valid_rows,
             selection_stats.total_kept_blocks,
             selection_stats.total_valid_blocks,
+        )
+        logger.info(
+            "Sparse prefill torch retain-score per-head stats: layer_idx=%s "
+            "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+            "num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
+            "kept_blocks=%s valid_blocks=%s.",
+            layer_idx if layer_idx is not None else "NA",
+            layer_name or "unknown",
+            int(query.shape[0]),
+            int(key.shape[0]),
+            int(cfg.q_block),
+            int(cfg.k_block),
+            int(cfg.topk),
+            len(selection_stats.per_head_total_valid_rows),
+            per_head_payload["retain_scores"],
+            per_head_payload["densities"],
+            per_head_payload["valid_rows"],
+            per_head_payload["kept_blocks"],
+            per_head_payload["valid_blocks"],
         )
     output = _online_softmax_attention_with_mask(
         query_states,

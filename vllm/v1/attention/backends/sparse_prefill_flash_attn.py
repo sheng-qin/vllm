@@ -424,6 +424,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             cfg=self.sparse_cfg,
                             output_dtype=output.dtype,
                             record_retain_score=self.record_retain_score,
+                            layer=layer,
                         )
                     elif block_table is not None and block_table.numel() > 0:
                         sparse_output = run_triton_sparse_prefill_attention(
@@ -436,6 +437,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             seq_len=seq_len,
                             kv_cache_dtype=self.kv_cache_dtype,
                             record_retain_score=self.record_retain_score,
+                            layer=layer,
                         )
                     if sparse_output is not None:
                         _ensure_sparse_output_has_no_nan(
@@ -578,6 +580,7 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                     cfg=self.sparse_cfg,
                     output_dtype=output.dtype,
                     record_retain_score=self.record_retain_score,
+                    layer=layer,
                 )
                 _ensure_sparse_output_has_no_nan(
                     sparse_output,

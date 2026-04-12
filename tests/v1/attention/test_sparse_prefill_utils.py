@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm.v1.attention.backends import sparse_prefill_utils as sparse_prefill_utils_module
 from vllm.v1.attention.backends.sparse_prefill_flash_attn import (
     _ensure_sparse_output_has_no_nan,
 )
@@ -24,6 +26,8 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     is_cached_prefix_prefill_request,
     is_full_prefill_request,
     is_sparse_prefill_request,
+    resolve_sparse_prefill_layer_info,
+    run_sparse_prefill_attention,
 )
 from vllm.v1.attention.ops.triton_sparse_prefill import (
     build_sparse_topk_block_metadata,
@@ -86,6 +90,22 @@ def test_sparse_prefill_retain_score_switch_parses_flags(
     assert is_sparse_prefill_retain_score_recording_enabled() is expected
 
 
+def test_resolve_sparse_prefill_layer_info_extracts_layer_name_and_index():
+    layer = SimpleNamespace(layer_name="model.layers.7.self_attn.attn")
+
+    layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+
+    assert layer_idx == 7
+    assert layer_name == "model.layers.7.self_attn.attn"
+
+
+def test_resolve_sparse_prefill_layer_info_handles_missing_layer_name():
+    layer_idx, layer_name = resolve_sparse_prefill_layer_info(object())
+
+    assert layer_idx is None
+    assert layer_name is None
+
+
 def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path):
     sparse_json = tmp_path / "sparse.json"
     sparse_json.write_text(
@@ -138,6 +158,9 @@ def test_build_sparse_topk_block_metadata_records_retained_attention_score():
     assert metadata.selection_stats.total_valid_blocks == 5
     assert metadata.selection_stats.total_kept_blocks == 2
     assert metadata.selection_stats.total_valid_rows == 2
+    assert metadata.selection_stats.per_head_total_valid_blocks == (5,)
+    assert metadata.selection_stats.per_head_total_kept_blocks == (2,)
+    assert metadata.selection_stats.per_head_total_valid_rows == (2,)
 
     row0 = torch.softmax(torch.tensor([0.0, 2.0]), dim=0)[-1]
     row1 = torch.softmax(torch.tensor([0.0, 2.0, 4.0]), dim=0)[-1]
@@ -145,6 +168,96 @@ def test_build_sparse_topk_block_metadata_records_retained_attention_score():
     assert metadata.selection_stats.retained_attention_score_mean == pytest.approx(
         expected_mean,
         rel=1e-6,
+    )
+    assert metadata.selection_stats.per_head_retained_attention_score_mean == (
+        pytest.approx(expected_mean, rel=1e-6),
+    )
+
+
+def test_build_sparse_topk_block_metadata_records_per_head_retained_attention_score():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=2,
+        topk=1,
+    )
+    query = torch.ones((4, 2, 1), dtype=torch.float32)
+    pooled_key = torch.tensor(
+        [[[[0.0], [1.0], [2.0]], [[0.0], [2.0], [4.0]]]],
+        dtype=torch.float32,
+    )
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=6,
+        record_selection_stats=True,
+    )
+
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_valid_blocks == 10
+    assert metadata.selection_stats.total_kept_blocks == 4
+    assert metadata.selection_stats.per_head_total_valid_blocks == (5, 5)
+    assert metadata.selection_stats.per_head_total_kept_blocks == (2, 2)
+    assert metadata.selection_stats.per_head_total_valid_rows == (2, 2)
+
+    head0_row0 = torch.softmax(torch.tensor([0.0, 1.0]), dim=0)[-1]
+    head0_row1 = torch.softmax(torch.tensor([0.0, 1.0, 2.0]), dim=0)[-1]
+    head1_row0 = torch.softmax(torch.tensor([0.0, 2.0]), dim=0)[-1]
+    head1_row1 = torch.softmax(torch.tensor([0.0, 2.0, 4.0]), dim=0)[-1]
+    expected = (
+        float((head0_row0 + head0_row1) / 2),
+        float((head1_row0 + head1_row1) / 2),
+    )
+    assert metadata.selection_stats.per_head_retained_attention_score_mean == pytest.approx(
+        expected,
+        rel=1e-6,
+    )
+
+
+def test_run_sparse_prefill_attention_logs_layer_aware_retain_score(monkeypatch):
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=2,
+        topk=1,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    key = torch.tensor([[[0.0]], [[1.0]], [[2.0]], [[3.0]]], dtype=torch.float32)
+    value = key.clone()
+    layer = SimpleNamespace(layer_name="model.layers.3.self_attn.attn")
+
+    logged: list[str] = []
+
+    def _capture_info(message: str, *args):
+        logged.append(message % args)
+
+    monkeypatch.setattr(sparse_prefill_utils_module.logger, "info", _capture_info)
+
+    run_sparse_prefill_attention(
+        query=query,
+        key=key,
+        value=value,
+        scaling=1.0,
+        cfg=cfg,
+        output_dtype=torch.float32,
+        record_retain_score=True,
+        layer=layer,
+    )
+
+    assert any(
+        "layer_idx=3 layer_name=model.layers.3.self_attn.attn" in message
+        for message in logged
+    )
+    assert any(
+        "retain_scores=[0.940399]" in message
+        and "densities=[0.666667]" in message
+        and "valid_rows=[2]" in message
+        for message in logged
     )
 
 
