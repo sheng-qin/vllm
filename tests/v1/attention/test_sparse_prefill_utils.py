@@ -9,6 +9,8 @@ import torch
 
 from vllm.v1.attention.backends import sparse_prefill_utils as sparse_prefill_utils_module
 from vllm.v1.attention.backends.sparse_prefill_flash_attn import (
+    AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
+    _parse_optional_env_flag,
     _ensure_sparse_output_has_no_nan,
 )
 from vllm.v1.attention.backends.sparse_prefill_utils import (
@@ -107,6 +109,35 @@ def test_sparse_prefill_retain_score_switch_rejects_invalid_mode(monkeypatch):
 
     with pytest.raises(ValueError, match="must be one of"):
         get_sparse_prefill_retain_score_log_mode()
+
+
+def test_sparse_force_paged_full_prefill_defaults_to_enabled(monkeypatch):
+    monkeypatch.delenv(
+        AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV, raising=False
+    )
+
+    assert (
+        _parse_optional_env_flag(
+            AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
+            default=True,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize("env_value", ["0", "false", "off", "No"])
+def test_sparse_force_paged_full_prefill_accepts_explicit_disable(
+    monkeypatch, env_value: str
+):
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV, env_value)
+
+    assert (
+        _parse_optional_env_flag(
+            AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
+            default=True,
+        )
+        is False
+    )
 
 
 def test_resolve_sparse_prefill_layer_info_extracts_layer_name_and_index():

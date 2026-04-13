@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -32,6 +34,32 @@ from vllm.v1.attention.ops.triton_sparse_prefill import (
 )
 
 logger = init_logger(__name__)
+
+AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV = (
+    "AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL"
+)
+
+
+def _parse_optional_env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+
+    logger.warning_once(
+        "Sparse prefill FlashAttention received unrecognized %s=%r; using "
+        "default value %s.",
+        name,
+        value,
+        default,
+        scope="local",
+    )
+    return default
 
 
 def _ensure_sparse_output_has_no_nan(
@@ -195,6 +223,10 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
         self.sparse_impl_mode = get_sparse_prefill_impl_mode()
         self.retain_score_log_mode = get_sparse_prefill_retain_score_log_mode()
         self.record_retain_score = self.retain_score_log_mode != "off"
+        self.force_paged_full_prefill = _parse_optional_env_flag(
+            AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
+            default=True,
+        )
         logger.info_once(
             "Sparse prefill FlashAttention backend enabled with scheme %s "
             "(q_block=%d, k_block=%d, topk=%d, impl=%s). Eligible prefill "
@@ -213,6 +245,22 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                 "with mode=%s for sparse requests because %s is enabled.",
                 self.retain_score_log_mode,
                 AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
+                scope="local",
+            )
+        if self.force_paged_full_prefill:
+            logger.info_once(
+                "Sparse prefill FlashAttention will route full-prefill sparse "
+                "requests through paged KV metadata by default. Set %s=0 to "
+                "keep the contiguous full-prefill path.",
+                AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
+                scope="local",
+            )
+        else:
+            logger.info_once(
+                "Sparse prefill FlashAttention will keep the contiguous "
+                "full-prefill path because %s disables paged full-prefill "
+                "routing.",
+                AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
                 scope="local",
             )
 
@@ -417,19 +465,18 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
 
             if self.sparse_impl_mode != "torch":
                 try:
-                    if is_full_prefill_request(query_len, seq_len):
-                        sparse_output = run_triton_sparse_prefill_attention(
-                            query=sparse_query,
-                            key=key_actual[q_start:q_end],
-                            value=value_actual[q_start:q_end],
-                            scaling=self.scale,
-                            cfg=self.sparse_cfg,
-                            output_dtype=output.dtype,
-                            record_retain_score=self.record_retain_score,
-                            retain_score_log_mode=self.retain_score_log_mode,
-                            layer=layer,
+                    use_paged_triton_path = (
+                        block_table is not None
+                        and block_table.numel() > 0
+                        and (
+                            is_cached_prefix_prefill_request(query_len, seq_len)
+                            or (
+                                self.force_paged_full_prefill
+                                and is_full_prefill_request(query_len, seq_len)
+                            )
                         )
-                    elif block_table is not None and block_table.numel() > 0:
+                    )
+                    if use_paged_triton_path:
                         sparse_output = run_triton_sparse_prefill_attention(
                             query=sparse_query,
                             scaling=self.scale,
@@ -439,6 +486,18 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             block_table_row=block_table[req_idx],
                             seq_len=seq_len,
                             kv_cache_dtype=self.kv_cache_dtype,
+                            record_retain_score=self.record_retain_score,
+                            retain_score_log_mode=self.retain_score_log_mode,
+                            layer=layer,
+                        )
+                    elif is_full_prefill_request(query_len, seq_len):
+                        sparse_output = run_triton_sparse_prefill_attention(
+                            query=sparse_query,
+                            key=key_actual[q_start:q_end],
+                            value=value_actual[q_start:q_end],
+                            scaling=self.scale,
+                            cfg=self.sparse_cfg,
+                            output_dtype=output.dtype,
                             record_retain_score=self.record_retain_score,
                             retain_score_log_mode=self.retain_score_log_mode,
                             layer=layer,
