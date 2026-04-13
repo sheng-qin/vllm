@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import time
 
 import torch
 
@@ -24,6 +26,95 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
 )
 
 logger = init_logger(__name__)
+AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN_ENV = (
+    "AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN"
+)
+RETAIN_TILE_SIZE = 128
+RETAIN_MASK_WORD_BITS = 32
+RETAIN_MASK_WORDS = RETAIN_TILE_SIZE // RETAIN_MASK_WORD_BITS
+
+
+def _parse_env_flag(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_sparse_prefill_timing_breakdown_enabled() -> bool:
+    return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN_ENV))
+
+
+@dataclass
+class SparsePrefillTimingBreakdown:
+    enabled: bool
+    device: torch.device
+    timings_ms: dict[str, float]
+
+    def add(self, name: str, elapsed_ms: float) -> None:
+        if not self.enabled:
+            return
+        self.timings_ms[name] = self.timings_ms.get(name, 0.0) + float(elapsed_ms)
+
+    def sorted_items(self) -> list[tuple[str, float]]:
+        return sorted(
+            self.timings_ms.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+
+def _timed_call(
+    breakdown: SparsePrefillTimingBreakdown | None,
+    name: str,
+    fn,
+    /,
+    *args,
+    **kwargs,
+):
+    if breakdown is None or not breakdown.enabled:
+        return fn(*args, **kwargs)
+
+    if breakdown.device.type == "cuda":
+        torch.cuda.synchronize(device=breakdown.device)
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    if breakdown.device.type == "cuda":
+        torch.cuda.synchronize(device=breakdown.device)
+    breakdown.add(name, (time.perf_counter() - start) * 1000.0)
+    return result
+
+
+def _log_sparse_prefill_timing_breakdown(
+    *,
+    layer: object | None,
+    query_len: int,
+    seq_len: int,
+    paged_kv: bool,
+    total_ms: float,
+    breakdown: SparsePrefillTimingBreakdown | None,
+) -> None:
+    if breakdown is None or not breakdown.enabled or not breakdown.timings_ms:
+        return
+
+    layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+    details = ", ".join(
+        (
+            f"{name}={elapsed_ms:.3f}ms "
+            f"({(elapsed_ms / total_ms * 100.0) if total_ms > 0 else 0.0:.1f}%)"
+        )
+        for name, elapsed_ms in breakdown.sorted_items()
+    )
+    logger.info(
+        "Sparse prefill Triton timing breakdown: layer_idx=%s layer_name=%s "
+        "q_len=%d seq_len=%d path=%s total=%.3fms breakdown=[%s].",
+        layer_idx if layer_idx is not None else "NA",
+        layer_name or "unknown",
+        int(query_len),
+        int(seq_len),
+        "paged" if paged_kv else "contiguous",
+        float(total_ms),
+        details,
+    )
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -48,6 +139,7 @@ class SparseTopKBlockMetadata:
     q_blocks: int
     k_blocks: int
     q_abs_offset: int
+    retain_tile_block_mask: torch.Tensor | None = None
     selection_stats: SparsePrefillSelectionStats | None = None
 
 
@@ -147,6 +239,85 @@ def _pad_topk_indices(
     return torch.where(invalid, torch.full_like(padded, -1), padded)
 
 
+def _build_retain_tile_block_mask(
+    topk_block_indices: torch.Tensor,
+    *,
+    seq_len: int,
+    k_block: int,
+) -> torch.Tensor:
+    if topk_block_indices.dim() != 3:
+        raise ValueError(
+            "Expected topk_block_indices to have shape [heads, q_blocks, topk], "
+            f"got {tuple(topk_block_indices.shape)}."
+        )
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be > 0, got {seq_len}.")
+    if k_block <= 0:
+        raise ValueError(f"k_block must be > 0, got {k_block}.")
+
+    num_heads, q_blocks, _ = topk_block_indices.shape
+    num_k_iters = _ceil_div(seq_len, RETAIN_TILE_SIZE)
+    block_mask = torch.zeros(
+        num_heads,
+        q_blocks,
+        num_k_iters,
+        RETAIN_MASK_WORDS,
+        device=topk_block_indices.device,
+        dtype=torch.int64,
+    )
+
+    valid = topk_block_indices >= 0
+    if not bool(valid.any().item()):
+        return block_mask.to(torch.int32)
+
+    head_idx, q_block_idx, topk_rank = valid.nonzero(as_tuple=True)
+    del topk_rank
+    block_idx = topk_block_indices[valid].to(torch.int64)
+    block_start = block_idx * int(k_block)
+    block_end = (block_start + int(k_block) - 1).clamp_max(seq_len - 1)
+    first_iter = torch.div(block_start, RETAIN_TILE_SIZE, rounding_mode="floor")
+    last_iter = torch.div(block_end, RETAIN_TILE_SIZE, rounding_mode="floor")
+    bit_values = (1 << torch.arange(
+        RETAIN_MASK_WORD_BITS,
+        device=topk_block_indices.device,
+        dtype=torch.int64,
+    ))
+    flat_mask = block_mask.view(-1, RETAIN_MASK_WORDS)
+    max_tile_span = _ceil_div(int(k_block) + RETAIN_TILE_SIZE - 1, RETAIN_TILE_SIZE)
+
+    for span in range(max_tile_span):
+        iter_idx = first_iter + span
+        active = iter_idx <= last_iter
+        if not bool(active.any().item()):
+            continue
+        active_head = head_idx[active]
+        active_q_block = q_block_idx[active]
+        active_iter = iter_idx[active]
+        active_block = block_idx[active]
+        tile_sparse_base = torch.div(
+            active_iter * RETAIN_TILE_SIZE,
+            int(k_block),
+            rounding_mode="floor",
+        )
+        local_block_idx = active_block - tile_sparse_base
+        word_idx = torch.div(
+            local_block_idx,
+            RETAIN_MASK_WORD_BITS,
+            rounding_mode="floor",
+        )
+        bit_idx = torch.remainder(local_block_idx, RETAIN_MASK_WORD_BITS)
+        flat_row_idx = (
+            (active_head * q_blocks + active_q_block) * num_k_iters + active_iter
+        )
+        flat_mask.index_put_(
+            (flat_row_idx, word_idx),
+            bit_values.index_select(0, bit_idx),
+            accumulate=True,
+        )
+
+    return block_mask.to(torch.int32)
+
+
 def _summarize_topk_block_selection(
     *,
     masked_scores: torch.Tensor,
@@ -190,10 +361,18 @@ def build_sparse_topk_block_metadata(
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     k_len: int,
+    build_retain_tile_block_mask: bool = False,
     record_selection_stats: bool = False,
+    breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
-    pooled_query = _mean_pool_attention_blocks(query_states, cfg.q_block)
+    pooled_query = _timed_call(
+        breakdown,
+        "topk_query_pool",
+        _mean_pool_attention_blocks,
+        query_states,
+        cfg.q_block,
+    )
     if pooled_key.shape[1] != pooled_query.shape[1]:
         if pooled_query.shape[1] % pooled_key.shape[1] != 0:
             raise ValueError(
@@ -201,15 +380,26 @@ def build_sparse_topk_block_metadata(
                 f"by KV heads, got num_heads={pooled_query.shape[1]} and "
                 f"num_kv_heads={pooled_key.shape[1]}."
             )
-        pooled_key = _repeat_kv_heads(
-            pooled_key, pooled_query.shape[1] // pooled_key.shape[1]
+        pooled_key = _timed_call(
+            breakdown,
+            "topk_repeat_kv_heads",
+            _repeat_kv_heads,
+            pooled_key,
+            pooled_query.shape[1] // pooled_key.shape[1],
         )
 
-    block_scores = torch.matmul(
-        pooled_query.to(torch.float32),
-        pooled_key.to(torch.float32).transpose(-1, -2),
-    ) * float(scaling)
-    valid_block_mask = _build_causal_valid_block_mask(
+    block_scores = _timed_call(
+        breakdown,
+        "topk_score_matmul",
+        lambda: torch.matmul(
+            pooled_query.to(torch.float32),
+            pooled_key.to(torch.float32).transpose(-1, -2),
+        ) * float(scaling),
+    )
+    valid_block_mask = _timed_call(
+        breakdown,
+        "topk_build_mask",
+        _build_causal_valid_block_mask,
         q_len=query.shape[0],
         k_len=k_len,
         q_block=cfg.q_block,
@@ -223,18 +413,57 @@ def build_sparse_topk_block_metadata(
             valid_block_mask.shape[2],
             valid_block_mask.shape[3],
         )
-    masked_scores = torch.where(
-        valid_block_mask,
-        block_scores,
-        torch.full_like(block_scores, float("-inf")),
+    masked_scores = _timed_call(
+        breakdown,
+        "topk_apply_mask",
+        lambda: torch.where(
+            valid_block_mask,
+            block_scores,
+            torch.full_like(block_scores, float("-inf")),
+        ),
     )
     k_keep = min(int(cfg.topk), int(masked_scores.shape[-1]))
-    topk_result = torch.topk(masked_scores, k=k_keep, dim=-1)
+    topk_result = _timed_call(
+        breakdown,
+        "topk_select",
+        torch.topk,
+        masked_scores,
+        k=k_keep,
+        dim=-1,
+    )
     topk_idx = topk_result.indices
-    counts = valid_block_mask.sum(dim=-1).clamp_max(k_keep).to(torch.int32)
-    padded_topk_idx = _pad_topk_indices(topk_idx, counts, full_topk=int(cfg.topk))
+    counts = _timed_call(
+        breakdown,
+        "topk_count_valid",
+        lambda: valid_block_mask.sum(dim=-1).clamp_max(k_keep).to(torch.int32),
+    )
+    padded_topk_idx = _timed_call(
+        breakdown,
+        "topk_pad_indices",
+        _pad_topk_indices,
+        topk_idx,
+        counts,
+        full_topk=int(cfg.topk),
+    )
+    topk_block_indices = padded_topk_idx.squeeze(0).contiguous()
+    topk_block_counts = counts.squeeze(0).contiguous()
+    retain_tile_block_mask = (
+        _timed_call(
+            breakdown,
+            "retain_build_tile_mask",
+            _build_retain_tile_block_mask,
+            topk_block_indices,
+            seq_len=k_len,
+            k_block=int(cfg.k_block),
+        )
+        if build_retain_tile_block_mask
+        else None
+    )
     selection_stats = (
-        _summarize_topk_block_selection(
+        _timed_call(
+            breakdown,
+            "topk_selection_stats",
+            _summarize_topk_block_selection,
             masked_scores=masked_scores,
             topk_values=topk_result.values,
             valid_block_mask=valid_block_mask,
@@ -244,11 +473,12 @@ def build_sparse_topk_block_metadata(
         else None
     )
     return SparseTopKBlockMetadata(
-        topk_block_indices=padded_topk_idx.squeeze(0).contiguous(),
-        topk_block_counts=counts.squeeze(0).contiguous(),
+        topk_block_indices=topk_block_indices,
+        topk_block_counts=topk_block_counts,
         q_blocks=_ceil_div(query.shape[0], cfg.q_block),
         k_blocks=_ceil_div(k_len, cfg.k_block),
         q_abs_offset=k_len - query.shape[0],
+        retain_tile_block_mask=retain_tile_block_mask,
         selection_stats=selection_stats,
     )
 
@@ -262,13 +492,21 @@ def build_sparse_topk_block_metadata_from_paged_cache(
     scaling: float,
     kv_cache_dtype: str,
     cfg: SparsePrefillTopKConfig,
+    build_retain_tile_block_mask: bool = False,
     record_selection_stats: bool = False,
+    breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
-    key_cache, _ = _extract_unquantized_paged_kv(
+    key_cache, _ = _timed_call(
+        breakdown,
+        "paged_extract_kv_for_topk",
+        _extract_unquantized_paged_kv,
         kv_cache,
         kv_cache_dtype=kv_cache_dtype,
     )
-    pooled_key = _pool_paged_key_blocks(
+    pooled_key = _timed_call(
+        breakdown,
+        "paged_pool_key",
+        _pool_paged_key_blocks,
         key_cache=key_cache,
         block_table_row=block_table_row,
         seq_len=seq_len,
@@ -280,7 +518,9 @@ def build_sparse_topk_block_metadata_from_paged_cache(
         scaling=scaling,
         cfg=cfg,
         k_len=seq_len,
+        build_retain_tile_block_mask=build_retain_tile_block_mask,
         record_selection_stats=record_selection_stats,
+        breakdown=breakdown,
     )
 
 
@@ -767,6 +1007,7 @@ def _launch_contiguous_sparse_attention(
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None,
+    breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> torch.Tensor:
     output = torch.empty_like(
         query,
@@ -780,50 +1021,62 @@ def _launch_contiguous_sparse_attention(
     num_queries_per_kv = query.shape[1] // key.shape[1]
     grid = (topk_metadata.q_blocks, query.shape[1])
     num_warps = 4 if head_size <= 64 else 8
-    _sparse_prefill_attention_contiguous_kernel[grid](
-        query,
-        key,
-        value,
-        topk_metadata.topk_block_indices,
-        topk_metadata.topk_block_counts,
-        output,
-        float(scaling) * RCP_LN2,
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        topk_metadata.topk_block_indices.stride(0),
-        topk_metadata.topk_block_indices.stride(1),
-        topk_metadata.topk_block_indices.stride(2),
-        topk_metadata.topk_block_counts.stride(0),
-        topk_metadata.topk_block_counts.stride(1),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        query.shape[0],
-        key.shape[0],
-        topk_metadata.q_abs_offset,
-        num_queries_per_kv,
-        Q_BLOCK=int(cfg.q_block),
-        K_BLOCK=int(cfg.k_block),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        TOPK=int(cfg.topk),
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=head_size_padded,
-        USE_SMALL_K=use_small_k,
-        num_warps=num_warps,
-        num_stages=1,
+    _timed_call(
+        breakdown,
+        "attn_kernel",
+        lambda: _sparse_prefill_attention_contiguous_kernel[grid](
+            query,
+            key,
+            value,
+            topk_metadata.topk_block_indices,
+            topk_metadata.topk_block_counts,
+            output,
+            float(scaling) * RCP_LN2,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            topk_metadata.topk_block_indices.stride(0),
+            topk_metadata.topk_block_indices.stride(1),
+            topk_metadata.topk_block_indices.stride(2),
+            topk_metadata.topk_block_counts.stride(0),
+            topk_metadata.topk_block_counts.stride(1),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            query.shape[0],
+            key.shape[0],
+            topk_metadata.q_abs_offset,
+            num_queries_per_kv,
+            Q_BLOCK=int(cfg.q_block),
+            K_BLOCK=int(cfg.k_block),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            TOPK=int(cfg.topk),
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=head_size_padded,
+            USE_SMALL_K=use_small_k,
+            num_warps=num_warps,
+            num_stages=1,
+        ),
     )
     if int(cfg.k_block) == 1:
-        output = _apply_k1_reference_fallback(
+        value_mean = _timed_call(
+            breakdown,
+            "attn_k1_value_mean",
+            lambda: value.to(torch.float32).mean(dim=0),
+        )
+        output = _timed_call(
+            breakdown,
+            "attn_k1_reference_fallback",
+            _apply_k1_reference_fallback,
             output=output,
-            value_mean=value.to(torch.float32).mean(dim=0),
+            value_mean=value_mean,
             topk_metadata=topk_metadata,
             q_block=int(cfg.q_block),
         )
@@ -841,8 +1094,12 @@ def _launch_paged_sparse_attention(
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     output_dtype: torch.dtype | None,
+    breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> torch.Tensor:
-    key_cache, value_cache = _extract_unquantized_paged_kv(
+    key_cache, value_cache = _timed_call(
+        breakdown,
+        "attn_extract_kv",
+        _extract_unquantized_paged_kv,
         kv_cache,
         kv_cache_dtype=kv_cache_dtype,
     )
@@ -851,7 +1108,11 @@ def _launch_paged_sparse_attention(
         query,
         dtype=query.dtype if output_dtype is None else output_dtype,
     )
-    block_table_row = block_table_row.to(device=query.device, dtype=torch.int32).contiguous()
+    block_table_row = _timed_call(
+        breakdown,
+        "attn_prepare_block_table",
+        lambda: block_table_row.to(device=query.device, dtype=torch.int32).contiguous(),
+    )
     block_m = triton.next_power_of_2(int(cfg.q_block))
     block_n = triton.next_power_of_2(int(cfg.k_block))
     use_small_k = block_n < 16
@@ -860,62 +1121,343 @@ def _launch_paged_sparse_attention(
     num_queries_per_kv = query.shape[1] // key_cache.shape[2]
     grid = (topk_metadata.q_blocks, query.shape[1])
     num_warps = 4 if head_size <= 64 else 8
-    _sparse_prefill_attention_paged_kernel[grid](
-        query,
-        key_cache,
-        value_cache,
-        block_table_row,
-        topk_metadata.topk_block_indices,
-        topk_metadata.topk_block_counts,
-        output,
-        float(scaling) * RCP_LN2,
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        key_cache.stride(3),
-        value_cache.stride(0),
-        value_cache.stride(1),
-        value_cache.stride(2),
-        value_cache.stride(3),
-        topk_metadata.topk_block_indices.stride(0),
-        topk_metadata.topk_block_indices.stride(1),
-        topk_metadata.topk_block_indices.stride(2),
-        topk_metadata.topk_block_counts.stride(0),
-        topk_metadata.topk_block_counts.stride(1),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        query.shape[0],
-        seq_len,
-        topk_metadata.q_abs_offset,
-        num_queries_per_kv,
-        CACHE_BLOCK_SIZE=cache_block_size,
-        Q_BLOCK=int(cfg.q_block),
-        K_BLOCK=int(cfg.k_block),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        TOPK=int(cfg.topk),
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=head_size_padded,
-        USE_SMALL_K=use_small_k,
-        num_warps=num_warps,
-        num_stages=1,
+    _timed_call(
+        breakdown,
+        "attn_kernel",
+        lambda: _sparse_prefill_attention_paged_kernel[grid](
+            query,
+            key_cache,
+            value_cache,
+            block_table_row,
+            topk_metadata.topk_block_indices,
+            topk_metadata.topk_block_counts,
+            output,
+            float(scaling) * RCP_LN2,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            value_cache.stride(3),
+            topk_metadata.topk_block_indices.stride(0),
+            topk_metadata.topk_block_indices.stride(1),
+            topk_metadata.topk_block_indices.stride(2),
+            topk_metadata.topk_block_counts.stride(0),
+            topk_metadata.topk_block_counts.stride(1),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            query.shape[0],
+            seq_len,
+            topk_metadata.q_abs_offset,
+            num_queries_per_kv,
+            CACHE_BLOCK_SIZE=cache_block_size,
+            Q_BLOCK=int(cfg.q_block),
+            K_BLOCK=int(cfg.k_block),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            TOPK=int(cfg.topk),
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=head_size_padded,
+            USE_SMALL_K=use_small_k,
+            num_warps=num_warps,
+            num_stages=1,
+        ),
     )
     if int(cfg.k_block) == 1:
-        output = _apply_k1_reference_fallback(
+        value_mean = _timed_call(
+            breakdown,
+            "attn_k1_value_mean",
+            _gather_paged_value_mean,
+            value_cache=value_cache,
+            block_table_row=block_table_row,
+            seq_len=seq_len,
+        )
+        output = _timed_call(
+            breakdown,
+            "attn_k1_reference_fallback",
+            _apply_k1_reference_fallback,
             output=output,
-            value_mean=_gather_paged_value_mean(
-                value_cache=value_cache,
-                block_table_row=block_table_row,
-                seq_len=seq_len,
-            ),
+            value_mean=value_mean,
             topk_metadata=topk_metadata,
             q_block=int(cfg.q_block),
         )
     return output
+
+
+@triton.jit
+def _retain_score_paged_kernel(
+    query_ptr,
+    key_cache_ptr,
+    block_table_ptr,
+    retain_block_mask_ptr,
+    output_ptr,
+    sm_scale,
+    q_stride_tok,
+    q_stride_head,
+    q_stride_dim,
+    kc_stride_blk,
+    kc_stride_slot,
+    kc_stride_head,
+    kc_stride_dim,
+    retain_mask_head_stride,
+    retain_mask_qblock_stride,
+    retain_mask_kiter_stride,
+    retain_mask_word_stride,
+    out_stride_tok,
+    out_stride_head,
+    q_len,
+    seq_len,
+    q_abs_offset,
+    num_queries_per_kv,
+    num_k_iters,
+    K_BLOCK_SPARSE: tl.constexpr,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    q_block_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // num_queries_per_kv
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    q_pos = q_block_idx * Q_BLOCK + offs_m
+    q_mask = (offs_m < Q_BLOCK) & (q_pos < q_len)
+    safe_q_pos = tl.where(q_mask, q_pos, 0)
+    q_abs = safe_q_pos + q_abs_offset
+    dim_mask = offs_d < HEAD_SIZE
+
+    q_offsets = (
+        safe_q_pos[:, None] * q_stride_tok
+        + head_idx * q_stride_head
+        + offs_d[None, :] * q_stride_dim
+    )
+    query = tl.load(
+        query_ptr + q_offsets,
+        mask=q_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+
+    running_max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    running_denom = tl.zeros([BLOCK_M], dtype=tl.float32)
+    running_selected = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for k_iter in range(num_k_iters):
+        offs_n = tl.arange(0, BLOCK_N)
+        k_abs = k_iter * BLOCK_N + offs_n
+        token_valid = k_abs < seq_len
+        safe_k_abs = tl.where(token_valid, k_abs, 0)
+
+        physical_block_idx = tl.load(
+            block_table_ptr + (safe_k_abs // CACHE_BLOCK_SIZE),
+            mask=token_valid,
+            other=0,
+        )
+        slot = safe_k_abs % CACHE_BLOCK_SIZE
+        k_offsets = (
+            physical_block_idx[None, :] * kc_stride_blk
+            + slot[None, :] * kc_stride_slot
+            + kv_head_idx * kc_stride_head
+            + offs_d[:, None] * kc_stride_dim
+        )
+        key = tl.load(
+            key_cache_ptr + k_offsets,
+            mask=dim_mask[:, None] & token_valid[None, :],
+            other=0.0,
+        )
+
+        scores = tl.dot(query, key) * sm_scale
+
+        attn_mask = (
+            q_mask[:, None]
+            & token_valid[None, :]
+            & (q_abs[:, None] >= k_abs[None, :])
+        )
+        masked_scores = tl.where(attn_mask, scores, float("-inf"))
+
+        row_has_valid = tl.max(attn_mask.to(tl.int32), axis=1) > 0
+        block_max = tl.max(masked_scores, axis=1)
+        safe_block_max = tl.where(row_has_valid, block_max, 0.0)
+        new_max = tl.where(
+            row_has_valid,
+            tl.maximum(running_max, block_max),
+            running_max,
+        )
+        prev_scale = tl.where(
+            running_max == float("-inf"),
+            0.0,
+            tl.math.exp2(running_max - new_max),
+        )
+        block_scale = tl.where(
+            row_has_valid,
+            tl.math.exp2(safe_block_max - new_max),
+            0.0,
+        )
+        probs = tl.where(
+            attn_mask,
+            tl.math.exp2(masked_scores - safe_block_max[:, None]),
+            0.0,
+        )
+
+        block_denom = tl.sum(probs, axis=1)
+        running_denom = running_denom * prev_scale + block_denom * block_scale
+
+        k_block_sparse = tl.where(token_valid, safe_k_abs // K_BLOCK_SPARSE, 0)
+        tile_sparse_base = (k_iter * BLOCK_N) // K_BLOCK_SPARSE
+        local_block_idx = tl.where(token_valid, k_block_sparse - tile_sparse_base, 0)
+        local_word_idx = local_block_idx // 32
+        local_bit_idx = local_block_idx % 32
+        bit_mask = 1 << local_bit_idx
+        retain_mask_base = (
+            head_idx * retain_mask_head_stride
+            + q_block_idx * retain_mask_qblock_stride
+            + k_iter * retain_mask_kiter_stride
+        )
+        is_selected = tl.zeros([BLOCK_N], dtype=tl.int32)
+        for word_idx in tl.static_range(0, 4):
+            word_value = tl.load(
+                retain_block_mask_ptr
+                + retain_mask_base
+                + word_idx * retain_mask_word_stride
+            )
+            word_match = token_valid & (local_word_idx == word_idx)
+            has_bit = (word_value & bit_mask) != 0
+            is_selected = tl.where(word_match & has_bit, 1, is_selected)
+
+        selected_probs = tl.where(
+            (is_selected > 0)[None, :] & attn_mask,
+            probs,
+            0.0,
+        )
+        selected_denom = tl.sum(selected_probs, axis=1)
+        running_selected = running_selected * prev_scale + selected_denom * block_scale
+
+        running_max = new_max
+
+    retain_score = running_selected / tl.maximum(running_denom, 1e-20)
+    retain_score = tl.where(q_mask, retain_score, 0.0)
+
+    out_offsets = safe_q_pos * out_stride_tok + head_idx * out_stride_head
+    tl.store(output_ptr + out_offsets, retain_score, mask=q_mask)
+
+
+def _compute_paged_retain_scores(
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    kv_cache_dtype: str,
+    topk_metadata: SparseTopKBlockMetadata,
+    scaling: float,
+    cfg: SparsePrefillTopKConfig,
+    breakdown: SparsePrefillTimingBreakdown | None = None,
+) -> torch.Tensor:
+    """Compute per-token retain scores for paged KV. Returns [q_len, num_heads] float32."""
+    retain_block_mask = topk_metadata.retain_tile_block_mask
+    if retain_block_mask is None:
+        raise ValueError(
+            "Paged retain-score kernel requires precomputed retain_tile_block_mask."
+        )
+    key_cache, _ = _timed_call(
+        breakdown,
+        "retain_extract_kv",
+        _extract_unquantized_paged_kv,
+        kv_cache,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    cache_block_size = int(key_cache.shape[1])
+    num_heads = query.shape[1]
+    q_len_val = int(query.shape[0])
+    output = torch.empty(q_len_val, num_heads, device=query.device, dtype=torch.float32)
+
+    block_table_int = _timed_call(
+        breakdown,
+        "retain_prepare_block_table",
+        lambda: block_table_row.to(device=query.device, dtype=torch.int32).contiguous(),
+    )
+    block_m = max(triton.next_power_of_2(int(cfg.q_block)), 16)
+    head_size = int(query.shape[-1])
+    head_size_padded = triton.next_power_of_2(head_size)
+    num_queries_per_kv = num_heads // key_cache.shape[2]
+
+    BLOCK_N = RETAIN_TILE_SIZE
+    num_k_iters = _ceil_div(seq_len, BLOCK_N)
+
+    grid = (topk_metadata.q_blocks, num_heads)
+    num_warps = 4 if head_size <= 64 else 8
+
+    _timed_call(
+        breakdown,
+        "retain_kernel",
+        lambda: _retain_score_paged_kernel[grid](
+            query,
+            key_cache,
+            block_table_int,
+            retain_block_mask,
+            output,
+            float(scaling) * RCP_LN2,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            retain_block_mask.stride(0),
+            retain_block_mask.stride(1),
+            retain_block_mask.stride(2),
+            retain_block_mask.stride(3),
+            output.stride(0),
+            output.stride(1),
+            q_len_val,
+            seq_len,
+            topk_metadata.q_abs_offset,
+            num_queries_per_kv,
+            num_k_iters,
+            K_BLOCK_SPARSE=int(cfg.k_block),
+            CACHE_BLOCK_SIZE=cache_block_size,
+            Q_BLOCK=int(cfg.q_block),
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=head_size_padded,
+            num_warps=num_warps,
+            num_stages=1,
+        ),
+    )
+    return output
+
+
+def _build_token_level_retain_stats(
+    per_token_retain_scores: torch.Tensor,
+    existing_stats: SparsePrefillSelectionStats,
+) -> SparsePrefillSelectionStats:
+    """Build selection stats with token-level retain scores, keeping block-level density."""
+    q_len = per_token_retain_scores.shape[0]
+    num_heads = per_token_retain_scores.shape[1]
+    per_head_retain_sum = per_token_retain_scores.to(torch.float64).sum(dim=0)
+    return SparsePrefillSelectionStats(
+        total_valid_blocks=existing_stats.total_valid_blocks,
+        total_kept_blocks=existing_stats.total_kept_blocks,
+        total_valid_rows=q_len * num_heads,
+        retained_attention_score_sum=float(per_head_retain_sum.sum().item()),
+        per_head_total_valid_blocks=existing_stats.per_head_total_valid_blocks,
+        per_head_total_kept_blocks=existing_stats.per_head_total_kept_blocks,
+        per_head_total_valid_rows=tuple(q_len for _ in range(num_heads)),
+        per_head_retained_attention_score_sum=tuple(
+            float(v) for v in per_head_retain_sum.tolist()
+        ),
+    )
 
 
 def _log_triton_retain_score_stats(
@@ -1014,12 +1556,26 @@ def run_triton_sparse_prefill_attention(
         raise RuntimeError("Triton is not available for sparse prefill attention.")
     if query.device.type != "cuda":
         raise RuntimeError("Triton sparse prefill attention requires CUDA tensors.")
+    timing_breakdown = SparsePrefillTimingBreakdown(
+        enabled=_is_sparse_prefill_timing_breakdown_enabled(),
+        device=query.device,
+        timings_ms={},
+    )
+    if timing_breakdown.enabled:
+        torch.cuda.synchronize(device=query.device)
+        total_start = time.perf_counter()
+    else:
+        total_start = 0.0
     resolved_log_mode = resolve_sparse_prefill_retain_score_log_mode(
         record_retain_score=record_retain_score,
         retain_score_log_mode=retain_score_log_mode,
     )
 
     if kv_cache is not None and block_table_row is not None and seq_len is not None:
+        should_compute_token_retain = (
+            resolved_log_mode != "off"
+            and int(cfg.topk) * int(cfg.k_block) < int(seq_len)
+        )
         topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
             query=query,
             kv_cache=kv_cache,
@@ -1028,18 +1584,39 @@ def run_triton_sparse_prefill_attention(
             scaling=scaling,
             kv_cache_dtype=kv_cache_dtype,
             cfg=cfg,
+            build_retain_tile_block_mask=should_compute_token_retain,
             record_selection_stats=resolved_log_mode != "off",
+            breakdown=timing_breakdown,
         )
+        selection_stats_for_log = topk_metadata.selection_stats
+        if (
+            should_compute_token_retain
+            and topk_metadata.selection_stats is not None
+        ):
+            per_token_scores = _compute_paged_retain_scores(
+                query=query,
+                kv_cache=kv_cache,
+                block_table_row=block_table_row,
+                seq_len=seq_len,
+                kv_cache_dtype=kv_cache_dtype,
+                topk_metadata=topk_metadata,
+                scaling=scaling,
+                cfg=cfg,
+                breakdown=timing_breakdown,
+            )
+            selection_stats_for_log = _build_token_level_retain_stats(
+                per_token_scores, topk_metadata.selection_stats,
+            )
         _log_triton_retain_score_stats(
             layer=layer,
             query_len=int(query.shape[0]),
             seq_len=int(seq_len),
             cfg=cfg,
             paged_kv=True,
-            selection_stats=topk_metadata.selection_stats,
+            selection_stats=selection_stats_for_log,
             retain_score_log_mode=resolved_log_mode,
         )
-        return _launch_paged_sparse_attention(
+        output = _launch_paged_sparse_attention(
             query=query,
             kv_cache=kv_cache,
             block_table_row=block_table_row,
@@ -1049,7 +1626,19 @@ def run_triton_sparse_prefill_attention(
             scaling=scaling,
             cfg=cfg,
             output_dtype=output_dtype,
+            breakdown=timing_breakdown,
         )
+        if timing_breakdown.enabled:
+            torch.cuda.synchronize(device=query.device)
+            _log_sparse_prefill_timing_breakdown(
+                layer=layer,
+                query_len=int(query.shape[0]),
+                seq_len=int(seq_len),
+                paged_kv=True,
+                total_ms=(time.perf_counter() - total_start) * 1000.0,
+                breakdown=timing_breakdown,
+            )
+        return output
 
     if key is None or value is None:
         raise ValueError(
@@ -1057,7 +1646,10 @@ def run_triton_sparse_prefill_attention(
             "(kv_cache, block_table_row, seq_len)."
         )
 
-    pooled_key = _mean_pool_attention_blocks(
+    pooled_key = _timed_call(
+        timing_breakdown,
+        "contiguous_pool_key",
+        _mean_pool_attention_blocks,
         key.transpose(0, 1).unsqueeze(0),
         cfg.k_block,
     )
@@ -1068,7 +1660,18 @@ def run_triton_sparse_prefill_attention(
         cfg=cfg,
         k_len=key.shape[0],
         record_selection_stats=resolved_log_mode != "off",
+        breakdown=timing_breakdown,
     )
+    if (
+        resolved_log_mode != "off"
+        and int(cfg.topk) * int(cfg.k_block) < int(key.shape[0])
+    ):
+        logger.info(
+            "contiguous retain score not computed "
+            "(topk=%d * k_block=%d = %d < k_len=%d)",
+            int(cfg.topk), int(cfg.k_block),
+            int(cfg.topk) * int(cfg.k_block), int(key.shape[0]),
+        )
     _log_triton_retain_score_stats(
         layer=layer,
         query_len=int(query.shape[0]),
@@ -1078,7 +1681,7 @@ def run_triton_sparse_prefill_attention(
         selection_stats=topk_metadata.selection_stats,
         retain_score_log_mode=resolved_log_mode,
     )
-    return _launch_contiguous_sparse_attention(
+    output = _launch_contiguous_sparse_attention(
         query=query,
         key=key,
         value=value,
@@ -1086,4 +1689,16 @@ def run_triton_sparse_prefill_attention(
         scaling=scaling,
         cfg=cfg,
         output_dtype=output_dtype,
+        breakdown=timing_breakdown,
     )
+    if timing_breakdown.enabled:
+        torch.cuda.synchronize(device=query.device)
+        _log_sparse_prefill_timing_breakdown(
+            layer=layer,
+            query_len=int(query.shape[0]),
+            seq_len=int(key.shape[0]),
+            paged_kv=False,
+            total_ms=(time.perf_counter() - total_start) * 1000.0,
+            breakdown=timing_breakdown,
+        )
+    return output

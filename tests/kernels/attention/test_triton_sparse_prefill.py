@@ -9,6 +9,8 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     run_sparse_prefill_attention,
 )
 from vllm.v1.attention.ops.triton_sparse_prefill import (
+    _compute_paged_retain_scores,
+    build_sparse_topk_block_metadata_from_paged_cache,
     run_triton_sparse_prefill_attention,
 )
 
@@ -51,6 +53,63 @@ def _build_paged_kv_cache(
         kv_cache[0, physical_block, :token_count].copy_(key[start:end])
         kv_cache[1, physical_block, :token_count].copy_(value[start:end])
     return kv_cache
+
+
+def _repeat_kv_heads_for_reference(key: torch.Tensor, num_heads: int) -> torch.Tensor:
+    num_kv_heads = key.shape[1]
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Expected num_heads={num_heads} to be divisible by num_kv_heads={num_kv_heads}."
+        )
+    repeats = num_heads // num_kv_heads
+    return key if repeats == 1 else key.repeat_interleave(repeats, dim=1)
+
+
+def _compute_paged_retain_scores_reference(
+    *,
+    query: torch.Tensor,
+    full_key: torch.Tensor,
+    scaling: float,
+    cfg: SparsePrefillTopKConfig,
+    topk_metadata,
+) -> torch.Tensor:
+    query_f32 = query.to(torch.float32)
+    key_f32 = _repeat_kv_heads_for_reference(full_key.to(torch.float32), query.shape[1])
+    seq_len = full_key.shape[0]
+    q_len, num_heads, _ = query.shape
+    q_abs_offset = int(topk_metadata.q_abs_offset)
+    token_positions = torch.arange(seq_len, device=query.device, dtype=torch.int64)
+    expected = torch.empty((q_len, num_heads), device=query.device, dtype=torch.float32)
+
+    for q_idx in range(q_len):
+        q_block_idx = q_idx // int(cfg.q_block)
+        q_abs = q_idx + q_abs_offset
+        causal_mask = token_positions <= q_abs
+
+        for head_idx in range(num_heads):
+            scores = torch.matmul(key_f32[:, head_idx], query_f32[q_idx, head_idx])
+            masked_scores = torch.where(
+                causal_mask,
+                scores * float(scaling),
+                torch.full((seq_len,), float("-inf"), device=query.device),
+            )
+            probs = torch.softmax(masked_scores, dim=0)
+
+            count = int(topk_metadata.topk_block_counts[head_idx, q_block_idx].item())
+            selected_blocks = topk_metadata.topk_block_indices[
+                head_idx, q_block_idx, :count
+            ]
+            selected_mask = torch.zeros(seq_len, device=query.device, dtype=torch.bool)
+            for block_idx in selected_blocks.tolist():
+                if block_idx < 0:
+                    continue
+                block_start = int(block_idx) * int(cfg.k_block)
+                block_end = min(block_start + int(cfg.k_block), seq_len)
+                selected_mask[block_start:block_end] = True
+
+            expected[q_idx, head_idx] = probs[causal_mask & selected_mask].sum()
+
+    return expected
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -149,6 +208,73 @@ def test_triton_sparse_prefill_matches_pytorch_cached_prefix(
     atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
     rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
     torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("k_block", [1, 4])
+def test_triton_paged_retain_scores_match_pytorch_reference(
+    dtype: torch.dtype,
+    k_block: int,
+):
+    torch.manual_seed(3)
+    seq_len = 37
+    query_len = 11
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 32
+    cache_block_size = 8
+    cfg = _make_cfg(topk=3, q_block=4, k_block=k_block)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    full_value = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    block_table_row = torch.tensor(
+        [2, 0, 4, 1, 3],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_cache = _build_paged_kv_cache(
+        key=full_key,
+        value=full_value,
+        block_table_row=block_table_row,
+        cache_block_size=cache_block_size,
+    )
+    topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        scaling=scale,
+        kv_cache_dtype="auto",
+        cfg=cfg,
+        build_retain_tile_block_mask=True,
+        record_selection_stats=False,
+    )
+
+    actual = _compute_paged_retain_scores(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        kv_cache_dtype="auto",
+        topk_metadata=topk_metadata,
+        scaling=scale,
+        cfg=cfg,
+    )
+    expected = _compute_paged_retain_scores_reference(
+        query=query,
+        full_key=full_key,
+        scaling=scale,
+        cfg=cfg,
+        topk_metadata=topk_metadata,
+    )
+
+    assert topk_metadata.retain_tile_block_mask is not None
+    assert torch.any(expected < 0.999)
+    atol = 5e-3 if dtype == torch.bfloat16 else 3e-4
+    rtol = 5e-3 if dtype == torch.bfloat16 else 3e-4
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.benchmark
