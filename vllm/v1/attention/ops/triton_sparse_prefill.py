@@ -16,6 +16,8 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     SparsePrefillRetainScoreLogMode,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
+    _keep_block_mask_to_block_indices,
+    _merge_mandatory_and_topk_sparse_blocks,
     _mean_pool_attention_blocks,
     build_sparse_prefill_selection_stats,
     format_sparse_prefill_per_head_payload,
@@ -321,11 +323,11 @@ def _build_retain_tile_block_mask(
 def _summarize_topk_block_selection(
     *,
     masked_scores: torch.Tensor,
-    topk_values: torch.Tensor,
     valid_block_mask: torch.Tensor,
-    counts: torch.Tensor,
+    keep_block_mask: torch.Tensor,
 ) -> SparsePrefillSelectionStats:
     valid_block_counts = valid_block_mask.sum(dim=-1).to(torch.int32)
+    kept_block_counts = keep_block_mask.sum(dim=-1).to(torch.int32)
     valid_row_mask = valid_block_counts > 0
     safe_logsumexp = torch.logsumexp(masked_scores, dim=-1)
     safe_logsumexp = torch.where(
@@ -334,21 +336,15 @@ def _summarize_topk_block_selection(
         torch.zeros_like(safe_logsumexp),
     )
 
-    rank = torch.arange(
-        topk_values.shape[-1],
-        device=topk_values.device,
-        dtype=counts.dtype,
-    ).view(*([1] * counts.dim()), topk_values.shape[-1])
-    keep_mask = rank < counts.unsqueeze(-1)
     retained_attention_score_mass = torch.where(
-        keep_mask & valid_row_mask.unsqueeze(-1),
-        torch.exp(topk_values - safe_logsumexp.unsqueeze(-1)),
-        torch.zeros_like(topk_values),
+        keep_block_mask & valid_row_mask.unsqueeze(-1),
+        torch.exp(masked_scores - safe_logsumexp.unsqueeze(-1)),
+        torch.zeros_like(masked_scores),
     ).sum(dim=-1)
 
     return build_sparse_prefill_selection_stats(
         valid_block_counts=valid_block_counts,
-        kept_block_counts=counts,
+        kept_block_counts=kept_block_counts,
         valid_row_mask=valid_row_mask,
         retained_attention_score_mass=retained_attention_score_mass,
     )
@@ -422,28 +418,22 @@ def build_sparse_topk_block_metadata(
             torch.full_like(block_scores, float("-inf")),
         ),
     )
-    k_keep = min(int(cfg.topk), int(masked_scores.shape[-1]))
-    topk_result = _timed_call(
+    keep_block_mask, counts = _timed_call(
         breakdown,
         "topk_select",
-        torch.topk,
+        _merge_mandatory_and_topk_sparse_blocks,
         masked_scores,
-        k=k_keep,
-        dim=-1,
+        valid_block_mask,
+        cfg=cfg,
     )
-    topk_idx = topk_result.indices
-    counts = _timed_call(
-        breakdown,
-        "topk_count_valid",
-        lambda: valid_block_mask.sum(dim=-1).clamp_max(k_keep).to(torch.int32),
-    )
+    selection_width = min(int(cfg.max_selected_blocks), int(masked_scores.shape[-1]))
     padded_topk_idx = _timed_call(
         breakdown,
         "topk_pad_indices",
-        _pad_topk_indices,
-        topk_idx,
-        counts,
-        full_topk=int(cfg.topk),
+        _keep_block_mask_to_block_indices,
+        keep_block_mask,
+        counts=counts,
+        full_topk=selection_width,
     )
     topk_block_indices = padded_topk_idx.squeeze(0).contiguous()
     topk_block_counts = counts.squeeze(0).contiguous()
@@ -465,9 +455,8 @@ def build_sparse_topk_block_metadata(
             "topk_selection_stats",
             _summarize_topk_block_selection,
             masked_scores=masked_scores,
-            topk_values=topk_result.values,
             valid_block_mask=valid_block_mask,
-            counts=counts,
+            keep_block_mask=keep_block_mask,
         )
         if record_selection_stats
         else None
@@ -1057,7 +1046,7 @@ def _launch_contiguous_sparse_attention(
             K_BLOCK=int(cfg.k_block),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            TOPK=int(cfg.topk),
+            TOPK=int(topk_metadata.topk_block_indices.shape[2]),
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
             USE_SMALL_K=use_small_k,
@@ -1161,7 +1150,7 @@ def _launch_paged_sparse_attention(
             K_BLOCK=int(cfg.k_block),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            TOPK=int(cfg.topk),
+            TOPK=int(topk_metadata.topk_block_indices.shape[2]),
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
             USE_SMALL_K=use_small_k,
@@ -1572,10 +1561,6 @@ def run_triton_sparse_prefill_attention(
     )
 
     if kv_cache is not None and block_table_row is not None and seq_len is not None:
-        should_compute_token_retain = (
-            resolved_log_mode != "off"
-            and int(cfg.topk) * int(cfg.k_block) < int(seq_len)
-        )
         topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
             query=query,
             kv_cache=kv_cache,
@@ -1584,11 +1569,17 @@ def run_triton_sparse_prefill_attention(
             scaling=scaling,
             kv_cache_dtype=kv_cache_dtype,
             cfg=cfg,
-            build_retain_tile_block_mask=should_compute_token_retain,
+            build_retain_tile_block_mask=resolved_log_mode != "off",
             record_selection_stats=resolved_log_mode != "off",
             breakdown=timing_breakdown,
         )
         selection_stats_for_log = topk_metadata.selection_stats
+        should_compute_token_retain = (
+            resolved_log_mode != "off"
+            and topk_metadata.selection_stats is not None
+            and topk_metadata.selection_stats.total_kept_blocks
+            < topk_metadata.selection_stats.total_valid_blocks
+        )
         if (
             should_compute_token_retain
             and topk_metadata.selection_stats is not None
@@ -1664,13 +1655,15 @@ def run_triton_sparse_prefill_attention(
     )
     if (
         resolved_log_mode != "off"
-        and int(cfg.topk) * int(cfg.k_block) < int(key.shape[0])
+        and topk_metadata.selection_stats is not None
+        and topk_metadata.selection_stats.total_kept_blocks
+        < topk_metadata.selection_stats.total_valid_blocks
     ):
         logger.info(
             "contiguous retain score not computed "
-            "(topk=%d * k_block=%d = %d < k_len=%d)",
-            int(cfg.topk), int(cfg.k_block),
-            int(cfg.topk) * int(cfg.k_block), int(key.shape[0]),
+            "(kept_blocks=%d < valid_blocks=%d)",
+            topk_metadata.selection_stats.total_kept_blocks,
+            topk_metadata.selection_stats.total_valid_blocks,
         )
     _log_triton_retain_score_stats(
         layer=layer,

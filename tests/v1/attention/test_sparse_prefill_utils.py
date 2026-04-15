@@ -182,6 +182,69 @@ def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path
     assert cfg.q_block == 16
     assert cfg.k_block == 16
     assert cfg.topk == 128
+    assert cfg.sink_block == 0
+    assert cfg.sliding_window_block == 0
+    assert cfg.max_selected_blocks == 128
+
+
+def test_get_sparse_prefill_topk_config_parses_sink_and_sliding_window_blocks(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_20": {
+                    "name": "q_256_k_1_topk_2048_swa_4_128",
+                    "q_block": 256,
+                    "k_block": 1,
+                    "topk": 2048,
+                    "sink_block": 4,
+                    "sliding_window_block": 128,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_20")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.key == "sparse_test_20"
+    assert cfg.q_block == 256
+    assert cfg.k_block == 1
+    assert cfg.topk == 2048
+    assert cfg.sink_block == 4
+    assert cfg.sliding_window_block == 128
+    assert cfg.max_selected_blocks == 2180
+
+
+@pytest.mark.parametrize("field_name", ["sink_block", "sliding_window_block"])
+def test_get_sparse_prefill_topk_config_rejects_negative_sink_or_window_blocks(
+    monkeypatch, tmp_path, field_name: str
+):
+    sparse_json = tmp_path / "sparse.json"
+    payload = {
+        "sparse_bad": {
+            "name": "bad_sparse",
+            "q_block": 16,
+            "k_block": 1,
+            "topk": 32,
+            "sink_block": 0,
+            "sliding_window_block": 0,
+        }
+    }
+    payload["sparse_bad"][field_name] = -1
+    sparse_json.write_text(json.dumps(payload))
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
+
+    with pytest.raises(ValueError, match=rf"Sparse scheme field '{field_name}'.*>= 0"):
+        get_sparse_prefill_topk_config()
 
 
 def test_build_sparse_topk_block_metadata_records_retained_attention_score():
@@ -266,6 +329,69 @@ def test_build_sparse_topk_block_metadata_records_per_head_retained_attention_sc
         expected,
         rel=1e-6,
     )
+
+
+def test_build_sparse_topk_block_metadata_merges_sink_window_and_remainder_topk():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        sink_block=1,
+        sliding_window_block=1,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor(
+        [[[[0.0], [1.0], [10.0], [20.0], [30.0], [40.0]]]],
+        dtype=torch.float32,
+    )
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=6,
+        record_selection_stats=True,
+    )
+
+    assert metadata.topk_block_indices.shape == (1, 2, 3)
+    assert metadata.topk_block_indices.shape[2] > cfg.topk
+    assert metadata.topk_block_counts.tolist() == [[3, 3]]
+    assert metadata.topk_block_indices[0, 0].tolist() == [0, 2, 3]
+    assert metadata.topk_block_indices[0, 1].tolist() == [0, 4, 5]
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_kept_blocks == 6
+
+
+def test_build_sparse_topk_block_metadata_dedupes_sink_window_overlap():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        sink_block=2,
+        sliding_window_block=2,
+    )
+    query = torch.ones((2, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor([[[[0.0], [1.0], [2.0]]]], dtype=torch.float32)
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=3,
+        record_selection_stats=True,
+    )
+
+    assert metadata.topk_block_indices.shape == (1, 1, 3)
+    assert metadata.topk_block_counts.tolist() == [[3]]
+    assert metadata.topk_block_indices[0, 0].tolist() == [0, 1, 2]
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_kept_blocks == 3
 
 
 @pytest.mark.parametrize(

@@ -37,7 +37,13 @@ class SparsePrefillTopKConfig:
     q_block: int
     k_block: int
     topk: int
+    sink_block: int = 0
+    sliding_window_block: int = 0
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
+
+    @property
+    def max_selected_blocks(self) -> int:
+        return int(self.topk) + int(self.sink_block) + int(self.sliding_window_block)
 
 
 @dataclass(frozen=True)
@@ -277,6 +283,14 @@ def _require_positive_int(value: object, field_name: str) -> int:
     return int(value)
 
 
+def _require_nonnegative_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Sparse scheme field '{field_name}' must be an integer.")
+    if value < 0:
+        raise ValueError(f"Sparse scheme field '{field_name}' must be >= 0.")
+    return int(value)
+
+
 @lru_cache(maxsize=None)
 def _load_sparse_prefill_topk_config(
     json_path: str, key: str
@@ -321,6 +335,14 @@ def _load_sparse_prefill_topk_config(
         q_block=_require_positive_int(scheme.get("q_block"), "q_block"),
         k_block=_require_positive_int(scheme.get("k_block"), "k_block"),
         topk=_require_positive_int(scheme.get("topk"), "topk"),
+        sink_block=_require_nonnegative_int(
+            scheme.get("sink_block", 0),
+            "sink_block",
+        ),
+        sliding_window_block=_require_nonnegative_int(
+            scheme.get("sliding_window_block", 0),
+            "sliding_window_block",
+        ),
     )
 
 
@@ -559,23 +581,107 @@ def _block_validity_from_token_mask(
     return allowed_blocks.any(dim=-1).any(dim=3)
 
 
-def _select_topk_sparse_blocks(
-    block_probs: torch.Tensor, valid_block_mask: torch.Tensor, *, topk: int
+def _build_mandatory_sparse_block_mask(
+    valid_block_mask: torch.Tensor,
+    *,
+    sink_block: int,
+    sliding_window_block: int,
 ) -> torch.Tensor:
-    width = block_probs.shape[-1]
-    neg_large = torch.full_like(block_probs, -1e30)
-    masked_probs = torch.where(valid_block_mask, block_probs, neg_large)
-    sorted_probs, sorted_idx = masked_probs.sort(dim=-1, descending=True)
-    del sorted_probs
-    sorted_valid = valid_block_mask.gather(-1, sorted_idx)
-    rank = torch.arange(width, device=block_probs.device).view(
-        *([1] * (block_probs.dim() - 1)),
+    if sink_block <= 0 and sliding_window_block <= 0:
+        return torch.zeros_like(valid_block_mask)
+
+    valid_int = valid_block_mask.to(torch.int32)
+    valid_rank = torch.cumsum(valid_int, dim=-1) - 1
+    keep_mask = torch.zeros_like(valid_block_mask)
+
+    if sink_block > 0:
+        keep_mask = keep_mask | (valid_block_mask & (valid_rank < int(sink_block)))
+
+    if sliding_window_block > 0:
+        valid_count = valid_int.sum(dim=-1, keepdim=True)
+        window_start_rank = (valid_count - int(sliding_window_block)).clamp_min(0)
+        keep_mask = keep_mask | (valid_block_mask & (valid_rank >= window_start_rank))
+
+    return keep_mask
+
+
+def _select_topk_sparse_blocks(
+    block_values: torch.Tensor, valid_block_mask: torch.Tensor, *, topk: int
+) -> torch.Tensor:
+    width = block_values.shape[-1]
+    k_keep = min(int(topk), width)
+    if k_keep <= 0:
+        return torch.zeros_like(valid_block_mask)
+
+    neg_large = torch.full_like(block_values, float("-inf"))
+    masked_values = torch.where(valid_block_mask, block_values, neg_large)
+    topk_idx = torch.topk(masked_values, k=k_keep, dim=-1).indices
+    counts = valid_block_mask.sum(dim=-1).clamp_max(k_keep).to(torch.int32)
+    rank = torch.arange(k_keep, device=block_values.device, dtype=torch.int32).view(
+        *([1] * (block_values.dim() - 1)),
+        k_keep,
+    )
+    keep_selected = rank < counts.unsqueeze(-1)
+    safe_topk_idx = torch.where(keep_selected, topk_idx, 0)
+    keep_mask = torch.zeros_like(valid_block_mask)
+    keep_mask.scatter_(-1, safe_topk_idx, keep_selected)
+    return keep_mask & valid_block_mask
+
+
+def _merge_mandatory_and_topk_sparse_blocks(
+    block_values: torch.Tensor,
+    valid_block_mask: torch.Tensor,
+    *,
+    cfg: SparsePrefillTopKConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mandatory_keep_mask = _build_mandatory_sparse_block_mask(
+        valid_block_mask,
+        sink_block=int(cfg.sink_block),
+        sliding_window_block=int(cfg.sliding_window_block),
+    )
+    additional_keep_mask = _select_topk_sparse_blocks(
+        block_values,
+        valid_block_mask & ~mandatory_keep_mask,
+        topk=int(cfg.topk),
+    )
+    keep_block_mask = mandatory_keep_mask | additional_keep_mask
+    return keep_block_mask, keep_block_mask.sum(dim=-1).to(torch.int32)
+
+
+def _keep_block_mask_to_block_indices(
+    keep_block_mask: torch.Tensor,
+    *,
+    full_topk: int,
+    counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if full_topk < 0:
+        raise ValueError(f"full_topk must be >= 0, got {full_topk}.")
+    if counts is None:
+        counts = keep_block_mask.sum(dim=-1).to(torch.int32)
+
+    if full_topk == 0:
+        return torch.empty(
+            (*keep_block_mask.shape[:-1], 0),
+            device=keep_block_mask.device,
+            dtype=torch.int32,
+        )
+
+    width = keep_block_mask.shape[-1]
+    block_idx = torch.arange(width, device=keep_block_mask.device, dtype=torch.int32).view(
+        *([1] * (keep_block_mask.dim() - 1)),
         width,
     )
-    keep_sorted = sorted_valid & (rank < min(int(topk), width))
-    keep_mask = torch.zeros_like(valid_block_mask)
-    keep_mask.scatter_(-1, sorted_idx, keep_sorted)
-    return keep_mask & valid_block_mask
+    block_idx = block_idx.expand_as(keep_block_mask)
+    sentinel = torch.full_like(block_idx, width)
+    sorted_idx = torch.where(keep_block_mask, block_idx, sentinel).sort(dim=-1).values
+    topk_idx = sorted_idx[..., :full_topk]
+    clamped_counts = counts.clamp_max(full_topk).to(torch.int32)
+    rank = torch.arange(full_topk, device=keep_block_mask.device, dtype=torch.int32).view(
+        *([1] * (keep_block_mask.dim() - 1)),
+        full_topk,
+    )
+    invalid = rank >= clamped_counts.unsqueeze(-1)
+    return torch.where(invalid, torch.full_like(topk_idx, -1), topk_idx)
 
 
 def _expand_sparse_block_mask_to_token_mask(
@@ -664,10 +770,10 @@ def _build_sparse_attention_mask_topk(
     row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
     block_probs = torch.where(row_has_valid, block_probs, torch.zeros_like(block_probs))
 
-    keep_block_mask = _select_topk_sparse_blocks(
-        block_probs,
+    keep_block_mask, _ = _merge_mandatory_and_topk_sparse_blocks(
+        masked_scores,
         valid_block_mask,
-        topk=cfg.topk,
+        cfg=cfg,
     )
     keep_token_mask = _expand_sparse_block_mask_to_token_mask(
         keep_block_mask,
