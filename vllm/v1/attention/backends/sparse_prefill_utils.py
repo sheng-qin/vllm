@@ -623,9 +623,11 @@ def _select_topk_sparse_blocks(
     )
     keep_selected = rank < counts.unsqueeze(-1)
     safe_topk_idx = torch.where(keep_selected, topk_idx, 0)
-    keep_mask = torch.zeros_like(valid_block_mask)
-    keep_mask.scatter_(-1, safe_topk_idx, keep_selected)
-    return keep_mask & valid_block_mask
+    # Padded ranks are mapped to index 0; use additive scatter so they cannot
+    # overwrite a real selection at block 0 when counts < topk.
+    keep_mask = torch.zeros_like(valid_block_mask, dtype=torch.int32)
+    keep_mask.scatter_add_(-1, safe_topk_idx, keep_selected.to(torch.int32))
+    return (keep_mask > 0) & valid_block_mask
 
 
 def _merge_mandatory_and_topk_sparse_blocks(

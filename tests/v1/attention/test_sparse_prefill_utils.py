@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     SparsePrefillTopKConfig,
+    _select_topk_sparse_blocks,
     _reconstruct_sequence_slots,
     gather_full_sequence_kv_from_paged_cache,
     get_sparse_prefill_impl_mode,
@@ -392,6 +393,22 @@ def test_build_sparse_topk_block_metadata_dedupes_sink_window_overlap():
     assert metadata.topk_block_indices[0, 0].tolist() == [0, 1, 2]
     assert metadata.selection_stats is not None
     assert metadata.selection_stats.total_kept_blocks == 3
+
+
+def test_select_topk_sparse_blocks_keeps_block_zero_when_counts_below_topk():
+    block_values = torch.tensor([[[[9.0, 8.0, 7.0, 6.0, -1.0, -1.0]]]], dtype=torch.float32)
+    valid_block_mask = torch.tensor(
+        [[[[True, True, True, True, False, False]]]],
+        dtype=torch.bool,
+    )
+
+    keep_mask = _select_topk_sparse_blocks(
+        block_values,
+        valid_block_mask,
+        topk=6,
+    )
+
+    assert keep_mask.tolist() == [[[[True, True, True, True, False, False]]]]
 
 
 @pytest.mark.parametrize(
