@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
     SparsePrefillTopKConfig,
+    format_sparse_prefill_selection_policy,
     gather_full_sequence_kv_from_paged_cache,
     get_sparse_prefill_topk_config,
     get_sparse_prefill_impl_mode,
@@ -227,15 +228,16 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
             AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
             default=True,
         )
+        selection_policy = format_sparse_prefill_selection_policy(self.sparse_cfg)
         logger.info_once(
             "Sparse prefill FlashAttention backend enabled with scheme %s "
-            "(q_block=%d, k_block=%d, topk=%d, impl=%s). Eligible prefill "
+            "(q_block=%d, k_block=%d, %s, impl=%s). Eligible prefill "
             "requests use the sparse override path while decode remains dense "
             "FlashAttention.",
             self.sparse_cfg.key,
             self.sparse_cfg.q_block,
             self.sparse_cfg.k_block,
-            self.sparse_cfg.topk,
+            selection_policy,
             self.sparse_impl_mode,
             scope="local",
         )

@@ -26,6 +26,8 @@ AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV = (
 
 DEFAULT_PV_BLOCK_SIZE = 128
 SparsePrefillRetainScoreLogMode = Literal["off", "summary", "layer", "head"]
+SparsePrefillQPoolingMode = Literal["mean_before", "mean_after"]
+SparsePrefillSelectionMode = Literal["topk", "threshold"]
 
 logger = init_logger(__name__)
 
@@ -36,14 +38,66 @@ class SparsePrefillTopKConfig:
     name: str
     q_block: int
     k_block: int
-    topk: int
+    topk: int | None = None
+    threshold: float | None = None
     sink_block: int = 0
     sliding_window_block: int = 0
+    q_pooling: SparsePrefillQPoolingMode = "mean_before"
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
+
+    def __post_init__(self) -> None:
+        if self.q_block <= 0:
+            raise ValueError(f"q_block must be > 0, got {self.q_block}.")
+        if self.k_block <= 0:
+            raise ValueError(f"k_block must be > 0, got {self.k_block}.")
+        if self.sink_block < 0:
+            raise ValueError(f"sink_block must be >= 0, got {self.sink_block}.")
+        if self.sliding_window_block < 0:
+            raise ValueError(
+                "sliding_window_block must be >= 0, "
+                f"got {self.sliding_window_block}."
+            )
+
+        has_topk = self.topk is not None
+        has_threshold = self.threshold is not None
+        if has_topk == has_threshold:
+            raise ValueError(
+                "Sparse prefill config must define exactly one of 'topk' "
+                "or 'threshold'."
+            )
+        if has_topk and (
+            isinstance(self.topk, bool) or int(self.topk) <= 0  # type: ignore[arg-type]
+        ):
+            raise ValueError(f"topk must be > 0, got {self.topk}.")
+        if has_threshold and (
+            isinstance(self.threshold, bool)
+            or float(self.threshold) <= 0.0  # type: ignore[arg-type]
+            or float(self.threshold) > 1.0  # type: ignore[arg-type]
+        ):
+            raise ValueError(
+                "threshold must be in the range (0, 1], "
+                f"got {self.threshold}."
+            )
+        if self.q_pooling == "mean_after" and self.k_block != 1:
+            raise ValueError(
+                "Sparse scheme field 'q_pooling'='mean_after' currently requires "
+                "'k_block' == 1."
+            )
+
+    @property
+    def selection_mode(self) -> SparsePrefillSelectionMode:
+        return "threshold" if self.threshold is not None else "topk"
 
     @property
     def max_selected_blocks(self) -> int:
-        return int(self.topk) + int(self.sink_block) + int(self.sliding_window_block)
+        base = int(self.topk) if self.topk is not None else 0
+        return base + int(self.sink_block) + int(self.sliding_window_block)
+
+
+def format_sparse_prefill_selection_policy(cfg: SparsePrefillTopKConfig) -> str:
+    if cfg.threshold is not None:
+        return f"threshold={cfg.threshold:g}"
+    return f"topk={cfg.topk}"
 
 
 @dataclass(frozen=True)
@@ -291,6 +345,36 @@ def _require_nonnegative_int(value: object, field_name: str) -> int:
     return int(value)
 
 
+def _require_probability(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"Sparse scheme field '{field_name}' must be a float in the range "
+            "(0, 1]."
+        )
+    value_f = float(value)
+    if value_f <= 0.0 or value_f > 1.0:
+        raise ValueError(
+            f"Sparse scheme field '{field_name}' must be in the range (0, 1]."
+        )
+    return value_f
+
+
+def _parse_sparse_prefill_q_pooling(value: object) -> SparsePrefillQPoolingMode:
+    if value is None:
+        return "mean_before"
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "Sparse scheme field 'q_pooling' must be a non-empty string."
+        )
+    normalized = value.strip().lower()
+    if normalized not in {"mean_before", "mean_after"}:
+        raise ValueError(
+            "Sparse scheme field 'q_pooling' must be one of "
+            "'mean_before' or 'mean_after'."
+        )
+    return normalized  # type: ignore[return-value]
+
+
 @lru_cache(maxsize=None)
 def _load_sparse_prefill_topk_config(
     json_path: str, key: str
@@ -318,23 +402,38 @@ def _load_sparse_prefill_topk_config(
             f"Sparse scheme '{key}' in '{json_path}' must be a JSON object."
         )
 
-    if "topk" not in scheme or scheme.get("topk") is None:
+    if scheme.get("ratio") is not None:
         raise ValueError(
-            f"Only topk sparse schemes are supported in vLLM v1. "
-            f"Scheme '{key}' must define 'topk'."
+            f"Only topk and threshold sparse schemes are supported in vLLM v1. "
+            f"Scheme '{key}' must not define 'ratio'."
         )
-    if scheme.get("ratio") is not None or scheme.get("threshold") is not None:
+    topk_value = scheme.get("topk")
+    threshold_value = scheme.get("threshold")
+    if (topk_value is None) == (threshold_value is None):
         raise ValueError(
-            f"Only topk sparse schemes are supported in vLLM v1. "
-            f"Scheme '{key}' must not define 'ratio' or 'threshold'."
+            f"Sparse scheme '{key}' must define exactly one of 'topk' "
+            f"or 'threshold'."
         )
+
+    q_block = _require_positive_int(scheme.get("q_block"), "q_block")
+    k_block = _require_positive_int(scheme.get("k_block"), "k_block")
+    topk = (
+        _require_positive_int(topk_value, "topk") if topk_value is not None else None
+    )
+    threshold = (
+        _require_probability(threshold_value, "threshold")
+        if threshold_value is not None
+        else None
+    )
+    q_pooling = _parse_sparse_prefill_q_pooling(scheme.get("q_pooling"))
 
     return SparsePrefillTopKConfig(
         key=key,
         name=str(scheme.get("name", key)),
-        q_block=_require_positive_int(scheme.get("q_block"), "q_block"),
-        k_block=_require_positive_int(scheme.get("k_block"), "k_block"),
-        topk=_require_positive_int(scheme.get("topk"), "topk"),
+        q_block=q_block,
+        k_block=k_block,
+        topk=topk,
+        threshold=threshold,
         sink_block=_require_nonnegative_int(
             scheme.get("sink_block", 0),
             "sink_block",
@@ -343,6 +442,7 @@ def _load_sparse_prefill_topk_config(
             scheme.get("sliding_window_block", 0),
             "sliding_window_block",
         ),
+        q_pooling=q_pooling,
     )
 
 
@@ -554,6 +654,57 @@ def _mean_pool_attention_blocks(x: torch.Tensor, block_size: int) -> torch.Tenso
     return x_blocks.sum(dim=3) / counts.view(1, 1, num_blocks, 1)
 
 
+def _pool_query_scores_to_blocks(
+    token_scores: torch.Tensor,
+    token_valid_mask: torch.Tensor,
+    *,
+    q_block: int,
+    q_pooling: SparsePrefillQPoolingMode,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q_pooling != "mean_after":
+        raise ValueError(
+            "Score-level q pooling only supports 'mean_after', "
+            f"got {q_pooling!r}."
+        )
+    if q_block <= 0:
+        raise ValueError(f"q_block must be > 0, got {q_block}.")
+    if token_scores.shape != token_valid_mask.shape:
+        raise ValueError(
+            "token_scores and token_valid_mask must have the same shape, got "
+            f"{tuple(token_scores.shape)} vs {tuple(token_valid_mask.shape)}."
+        )
+
+    batch_size, num_heads, q_len, k_blocks = token_scores.shape
+    q_blocks = math.ceil(q_len / q_block)
+    q_pad = q_blocks * q_block - q_len
+    scores_f = token_scores.to(torch.float32)
+    valid = token_valid_mask.to(torch.bool)
+    if q_pad > 0:
+        scores_f = F.pad(scores_f, (0, 0, 0, q_pad))
+        valid = F.pad(valid.to(torch.uint8), (0, 0, 0, q_pad), value=0).to(torch.bool)
+
+    score_blocks = scores_f.contiguous().view(
+        batch_size, num_heads, q_blocks, q_block, k_blocks
+    )
+    valid_blocks = valid.contiguous().view(
+        batch_size, num_heads, q_blocks, q_block, k_blocks
+    )
+    valid_counts = valid_blocks.sum(dim=3)
+    pooled_scores = torch.where(
+        valid_blocks,
+        score_blocks,
+        torch.zeros_like(score_blocks),
+    ).sum(dim=3)
+    pooled_scores = pooled_scores / valid_counts.to(scores_f.dtype).clamp_min(1.0)
+    valid_block_mask = valid_counts > 0
+    pooled_scores = torch.where(
+        valid_block_mask,
+        pooled_scores,
+        torch.zeros_like(pooled_scores),
+    )
+    return pooled_scores, valid_block_mask
+
+
 def _block_validity_from_token_mask(
     allowed_token_mask: torch.Tensor,
     *,
@@ -622,30 +773,106 @@ def _select_topk_sparse_blocks(
         k_keep,
     )
     keep_selected = rank < counts.unsqueeze(-1)
-    safe_topk_idx = torch.where(keep_selected, topk_idx, 0)
+    return _scatter_sparse_block_mask(
+        topk_idx,
+        keep_selected,
+        width=width,
+    ) & valid_block_mask
+
+
+def _scatter_sparse_block_mask(
+    block_idx: torch.Tensor,
+    keep_selected: torch.Tensor,
+    *,
+    width: int,
+) -> torch.Tensor:
+    safe_block_idx = torch.where(keep_selected, block_idx, 0)
     # Padded ranks are mapped to index 0; use additive scatter so they cannot
-    # overwrite a real selection at block 0 when counts < topk.
-    keep_mask = torch.zeros_like(valid_block_mask, dtype=torch.int32)
-    keep_mask.scatter_add_(-1, safe_topk_idx, keep_selected.to(torch.int32))
-    return (keep_mask > 0) & valid_block_mask
+    # overwrite a real selection at block 0 when counts < width.
+    keep_mask = torch.zeros(
+        (*block_idx.shape[:-1], width),
+        device=block_idx.device,
+        dtype=torch.int32,
+    )
+    keep_mask.scatter_add_(-1, safe_block_idx, keep_selected.to(torch.int32))
+    return keep_mask > 0
 
 
-def _merge_mandatory_and_topk_sparse_blocks(
+def _select_threshold_sparse_blocks(
+    block_probs: torch.Tensor,
+    valid_block_mask: torch.Tensor,
+    *,
+    required_mass: torch.Tensor,
+) -> torch.Tensor:
+    if block_probs.shape != valid_block_mask.shape:
+        raise ValueError(
+            "block_probs and valid_block_mask must have the same shape, got "
+            f"{tuple(block_probs.shape)} vs {tuple(valid_block_mask.shape)}."
+        )
+
+    width = block_probs.shape[-1]
+    if width <= 0:
+        return torch.zeros_like(valid_block_mask)
+
+    neg_large = torch.full_like(block_probs, float("-inf"))
+    masked_probs = torch.where(valid_block_mask, block_probs, neg_large)
+    sorted_probs, sorted_idx = torch.sort(masked_probs, dim=-1, descending=True)
+    candidate_counts = valid_block_mask.sum(dim=-1).to(torch.int32)
+    rank = torch.arange(width, device=block_probs.device, dtype=torch.int32).view(
+        *([1] * (block_probs.dim() - 1)),
+        width,
+    )
+    keep_candidate = rank < candidate_counts.unsqueeze(-1)
+    sorted_probs = torch.where(keep_candidate, sorted_probs, torch.zeros_like(sorted_probs))
+    cumulative_without_self = torch.cat(
+        [torch.zeros_like(sorted_probs[..., :1]), sorted_probs[..., :-1]],
+        dim=-1,
+    ).cumsum(dim=-1)
+    keep_selected = keep_candidate & (
+        cumulative_without_self < required_mass.to(block_probs.dtype)
+    )
+    return _scatter_sparse_block_mask(
+        sorted_idx,
+        keep_selected,
+        width=width,
+    ) & valid_block_mask
+
+
+def _merge_mandatory_and_sparse_blocks(
     block_values: torch.Tensor,
     valid_block_mask: torch.Tensor,
     *,
     cfg: SparsePrefillTopKConfig,
+    block_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mandatory_keep_mask = _build_mandatory_sparse_block_mask(
         valid_block_mask,
         sink_block=int(cfg.sink_block),
         sliding_window_block=int(cfg.sliding_window_block),
     )
-    additional_keep_mask = _select_topk_sparse_blocks(
-        block_values,
-        valid_block_mask & ~mandatory_keep_mask,
-        topk=int(cfg.topk),
-    )
+    selectable_block_mask = valid_block_mask & ~mandatory_keep_mask
+    if cfg.topk is not None:
+        additional_keep_mask = _select_topk_sparse_blocks(
+            block_values,
+            selectable_block_mask,
+            topk=int(cfg.topk),
+        )
+    else:
+        if block_probs is None:
+            raise ValueError("Threshold sparse selection requires block_probs.")
+        mandatory_mass = torch.where(
+            mandatory_keep_mask,
+            block_probs,
+            torch.zeros_like(block_probs),
+        ).sum(dim=-1, keepdim=True)
+        remaining_mass = (
+            torch.full_like(mandatory_mass, float(cfg.threshold)) - mandatory_mass
+        ).clamp_min(0.0)
+        additional_keep_mask = _select_threshold_sparse_blocks(
+            block_probs,
+            selectable_block_mask,
+            required_mass=remaining_mass,
+        )
     keep_block_mask = mandatory_keep_mask | additional_keep_mask
     return keep_block_mask, keep_block_mask.sum(dim=-1).to(torch.int32)
 
@@ -754,15 +981,47 @@ def _build_sparse_attention_mask_topk(
     mask_floor = torch.finfo(base_mask.dtype).min / 2
     allowed_token_mask = base_mask > mask_floor
 
-    pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
     pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
-    block_scores = torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
+    if cfg.q_pooling == "mean_after":
+        pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
+        block_score_rows: list[torch.Tensor] = []
+        valid_block_rows: list[torch.Tensor] = []
 
-    valid_block_mask = _block_validity_from_token_mask(
-        allowed_token_mask,
-        q_block=cfg.q_block,
-        k_block=cfg.k_block,
-    )
+        # Stream one q-block at a time to avoid materializing a full
+        # q_len x k_len token-score matrix for exact per-token query scoring.
+        for q_start in range(0, q_len, cfg.q_block):
+            q_end = min(q_start + int(cfg.q_block), q_len)
+            query_block = query[:, :, q_start:q_end, :].to(torch.float32)
+            token_scores = torch.matmul(query_block, pooled_key_t) * float(scaling)
+            block_token_mask = allowed_token_mask[:, :, q_start:q_end, :]
+            if cfg.k_block != 1:
+                block_token_mask = _block_validity_from_token_mask(
+                    block_token_mask,
+                    q_block=1,
+                    k_block=cfg.k_block,
+                )
+            block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
+                token_scores,
+                block_token_mask,
+                q_block=cfg.q_block,
+                q_pooling=cfg.q_pooling,
+            )
+            block_score_rows.append(block_scores_row)
+            valid_block_rows.append(valid_block_row)
+
+        block_scores = torch.cat(block_score_rows, dim=2)
+        valid_block_mask = torch.cat(valid_block_rows, dim=2)
+    elif cfg.q_pooling == "mean_before":
+        pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
+        block_scores = torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
+        valid_block_mask = _block_validity_from_token_mask(
+            allowed_token_mask,
+            q_block=cfg.q_block,
+            k_block=cfg.k_block,
+        )
+    else:
+        raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
+
     masked_scores = torch.where(
         valid_block_mask,
         block_scores,
@@ -772,10 +1031,11 @@ def _build_sparse_attention_mask_topk(
     row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
     block_probs = torch.where(row_has_valid, block_probs, torch.zeros_like(block_probs))
 
-    keep_block_mask, _ = _merge_mandatory_and_topk_sparse_blocks(
+    keep_block_mask, _ = _merge_mandatory_and_sparse_blocks(
         masked_scores,
         valid_block_mask,
         cfg=cfg,
+        block_probs=block_probs,
     )
     keep_token_mask = _expand_sparse_block_mask_to_token_mask(
         keep_block_mask,
@@ -928,13 +1188,14 @@ def run_sparse_prefill_attention(
         return_selection_stats=resolved_log_mode != "off",
     )
     if selection_stats is not None:
+        selection_policy = format_sparse_prefill_selection_policy(cfg)
         layer_idx = None
         layer_name = None
         if should_log_sparse_prefill_layer_info(resolved_log_mode):
             layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
             logger.info(
                 "Sparse prefill torch retain-score stats: layer_idx=%s "
-                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d %s "
                 "avg_retain_score=%.6f density=%.6f valid_rows=%d "
                 "kept_blocks=%d valid_blocks=%d.",
                 layer_idx if layer_idx is not None else "NA",
@@ -943,7 +1204,7 @@ def run_sparse_prefill_attention(
                 int(key.shape[0]),
                 int(cfg.q_block),
                 int(cfg.k_block),
-                int(cfg.topk),
+                selection_policy,
                 selection_stats.retained_attention_score_mean,
                 selection_stats.density,
                 selection_stats.total_valid_rows,
@@ -953,13 +1214,13 @@ def run_sparse_prefill_attention(
         else:
             logger.info(
                 "Sparse prefill torch retain-score stats: q_len=%d k_len=%d "
-                "q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+                "q_block=%d k_block=%d %s avg_retain_score=%.6f "
                 "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
                 int(query.shape[0]),
                 int(key.shape[0]),
                 int(cfg.q_block),
                 int(cfg.k_block),
-                int(cfg.topk),
+                selection_policy,
                 selection_stats.retained_attention_score_mean,
                 selection_stats.density,
                 selection_stats.total_valid_rows,
@@ -970,7 +1231,7 @@ def run_sparse_prefill_attention(
             per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
             logger.info(
                 "Sparse prefill torch retain-score per-head stats: layer_idx=%s "
-                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d topk=%d "
+                "layer_name=%s q_len=%d k_len=%d q_block=%d k_block=%d %s "
                 "num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
                 "kept_blocks=%s valid_blocks=%s.",
                 layer_idx if layer_idx is not None else "NA",
@@ -979,7 +1240,7 @@ def run_sparse_prefill_attention(
                 int(key.shape[0]),
                 int(cfg.q_block),
                 int(cfg.k_block),
-                int(cfg.topk),
+                selection_policy,
                 len(selection_stats.per_head_total_valid_rows),
                 per_head_payload["retain_scores"],
                 per_head_payload["densities"],

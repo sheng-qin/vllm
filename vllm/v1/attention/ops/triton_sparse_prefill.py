@@ -17,9 +17,11 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _keep_block_mask_to_block_indices,
-    _merge_mandatory_and_topk_sparse_blocks,
+    _merge_mandatory_and_sparse_blocks,
     _mean_pool_attention_blocks,
+    _pool_query_scores_to_blocks,
     build_sparse_prefill_selection_stats,
+    format_sparse_prefill_selection_policy,
     format_sparse_prefill_per_head_payload,
     resolve_sparse_prefill_layer_info,
     resolve_sparse_prefill_retain_score_log_mode,
@@ -30,6 +32,9 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
 logger = init_logger(__name__)
 AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN_ENV = (
     "AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN"
+)
+AUTOPTQ_VLLM_SPARSE_DEBUG_FULLY_MASKED_ROWS_ENV = (
+    "AUTOPTQ_VLLM_SPARSE_DEBUG_FULLY_MASKED_ROWS"
 )
 RETAIN_TILE_SIZE = 128
 RETAIN_MASK_WORD_BITS = 32
@@ -44,6 +49,10 @@ def _parse_env_flag(value: str | None) -> bool:
 
 def _is_sparse_prefill_timing_breakdown_enabled() -> bool:
     return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_TIMING_BREAKDOWN_ENV))
+
+
+def _is_sparse_prefill_fully_masked_row_debug_enabled() -> bool:
+    return _parse_env_flag(os.getenv(AUTOPTQ_VLLM_SPARSE_DEBUG_FULLY_MASKED_ROWS_ENV))
 
 
 @dataclass
@@ -216,6 +225,22 @@ def _build_causal_valid_block_mask(
     return k_block_start.view(1, 1, 1, k_blocks) <= q_abs_max.view(1, 1, q_blocks, 1)
 
 
+def _build_causal_valid_token_block_mask(
+    *,
+    q_abs_start: int,
+    q_count: int,
+    k_len: int,
+    k_block: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if q_count <= 0 or k_len <= 0:
+        raise ValueError(f"Expected positive q_count/k_len, got {q_count}/{k_len}.")
+    k_blocks = _ceil_div(k_len, k_block)
+    q_abs = torch.arange(q_count, device=device, dtype=torch.long) + int(q_abs_start)
+    k_block_start = torch.arange(k_blocks, device=device, dtype=torch.long) * k_block
+    return k_block_start.view(1, 1, 1, k_blocks) <= q_abs.view(1, 1, q_count, 1)
+
+
 def _pad_topk_indices(
     topk_idx: torch.Tensor,
     counts: torch.Tensor,
@@ -362,18 +387,11 @@ def build_sparse_topk_block_metadata(
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
-    pooled_query = _timed_call(
-        breakdown,
-        "topk_query_pool",
-        _mean_pool_attention_blocks,
-        query_states,
-        cfg.q_block,
-    )
-    if pooled_key.shape[1] != pooled_query.shape[1]:
-        if pooled_query.shape[1] % pooled_key.shape[1] != 0:
+    if pooled_key.shape[1] != query_states.shape[1]:
+        if query_states.shape[1] % pooled_key.shape[1] != 0:
             raise ValueError(
                 "Sparse Triton prefill requires query heads to be divisible "
-                f"by KV heads, got num_heads={pooled_query.shape[1]} and "
+                f"by KV heads, got num_heads={query_states.shape[1]} and "
                 f"num_kv_heads={pooled_key.shape[1]}."
             )
         pooled_key = _timed_call(
@@ -381,34 +399,88 @@ def build_sparse_topk_block_metadata(
             "topk_repeat_kv_heads",
             _repeat_kv_heads,
             pooled_key,
-            pooled_query.shape[1] // pooled_key.shape[1],
+            query_states.shape[1] // pooled_key.shape[1],
         )
+    if cfg.q_pooling == "mean_after":
 
-    block_scores = _timed_call(
-        breakdown,
-        "topk_score_matmul",
-        lambda: torch.matmul(
-            pooled_query.to(torch.float32),
-            pooled_key.to(torch.float32).transpose(-1, -2),
-        ) * float(scaling),
-    )
-    valid_block_mask = _timed_call(
-        breakdown,
-        "topk_build_mask",
-        _build_causal_valid_block_mask,
-        q_len=query.shape[0],
-        k_len=k_len,
-        q_block=cfg.q_block,
-        k_block=cfg.k_block,
-        device=query.device,
-    )
-    if valid_block_mask.shape[1] != block_scores.shape[1]:
-        valid_block_mask = valid_block_mask.expand(
-            valid_block_mask.shape[0],
-            block_scores.shape[1],
-            valid_block_mask.shape[2],
-            valid_block_mask.shape[3],
+        def _build_mean_after_block_scores() -> tuple[torch.Tensor, torch.Tensor]:
+            pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
+            q_abs_offset = k_len - query.shape[0]
+            block_score_rows: list[torch.Tensor] = []
+            valid_block_rows: list[torch.Tensor] = []
+
+            # Stream one q-block at a time so sparse_test_28 does not
+            # materialize the full token-score matrix.
+            for q_start in range(0, query.shape[0], cfg.q_block):
+                q_end = min(q_start + int(cfg.q_block), query.shape[0])
+                query_block = query_states[:, :, q_start:q_end, :].to(torch.float32)
+                token_scores = torch.matmul(query_block, pooled_key_t) * float(scaling)
+                token_valid_mask = _build_causal_valid_token_block_mask(
+                    q_abs_start=q_start + q_abs_offset,
+                    q_count=q_end - q_start,
+                    k_len=k_len,
+                    k_block=cfg.k_block,
+                    device=query.device,
+                )
+                if token_valid_mask.shape[1] != token_scores.shape[1]:
+                    token_valid_mask = token_valid_mask.expand(
+                        token_valid_mask.shape[0],
+                        token_scores.shape[1],
+                        token_valid_mask.shape[2],
+                        token_valid_mask.shape[3],
+                    )
+                block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
+                    token_scores,
+                    token_valid_mask,
+                    q_block=cfg.q_block,
+                    q_pooling=cfg.q_pooling,
+                )
+                block_score_rows.append(block_scores_row)
+                valid_block_rows.append(valid_block_row)
+
+            return torch.cat(block_score_rows, dim=2), torch.cat(valid_block_rows, dim=2)
+
+        block_scores, valid_block_mask = _timed_call(
+            breakdown,
+            "topk_mean_after",
+            _build_mean_after_block_scores,
         )
+    elif cfg.q_pooling == "mean_before":
+        pooled_query = _timed_call(
+            breakdown,
+            "topk_query_pool",
+            _mean_pool_attention_blocks,
+            query_states,
+            cfg.q_block,
+        )
+        block_scores = _timed_call(
+            breakdown,
+            "topk_score_matmul",
+            lambda: torch.matmul(
+                pooled_query.to(torch.float32),
+                pooled_key.to(torch.float32).transpose(-1, -2),
+            ) * float(scaling),
+        )
+        valid_block_mask = _timed_call(
+            breakdown,
+            "topk_build_mask",
+            _build_causal_valid_block_mask,
+            q_len=query.shape[0],
+            k_len=k_len,
+            q_block=cfg.q_block,
+            k_block=cfg.k_block,
+            device=query.device,
+        )
+        if valid_block_mask.shape[1] != block_scores.shape[1]:
+            valid_block_mask = valid_block_mask.expand(
+                valid_block_mask.shape[0],
+                block_scores.shape[1],
+                valid_block_mask.shape[2],
+                valid_block_mask.shape[3],
+            )
+    else:
+        raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
+
     masked_scores = _timed_call(
         breakdown,
         "topk_apply_mask",
@@ -418,15 +490,29 @@ def build_sparse_topk_block_metadata(
             torch.full_like(block_scores, float("-inf")),
         ),
     )
+    block_probs = None
+    if cfg.threshold is not None:
+        block_probs = _timed_call(
+            breakdown,
+            "topk_softmax",
+            lambda: torch.softmax(masked_scores, dim=-1),
+        )
+        row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
+        block_probs = torch.where(
+            row_has_valid,
+            block_probs,
+            torch.zeros_like(block_probs),
+        )
     keep_block_mask, counts = _timed_call(
         breakdown,
         "topk_select",
-        _merge_mandatory_and_topk_sparse_blocks,
+        _merge_mandatory_and_sparse_blocks,
         masked_scores,
         valid_block_mask,
         cfg=cfg,
+        block_probs=block_probs,
     )
-    selection_width = min(int(cfg.max_selected_blocks), int(masked_scores.shape[-1]))
+    selection_width = int(counts.max().item()) if counts.numel() > 0 else 0
     padded_topk_idx = _timed_call(
         breakdown,
         "topk_pad_indices",
@@ -536,11 +622,12 @@ def _smallk_weighted_value_sum(
     return acc
 
 
-def _fully_masked_row_mask_for_k1(
+def _fully_masked_row_mask(
     *,
     topk_metadata: SparseTopKBlockMetadata,
     q_len: int,
     q_block: int,
+    k_block: int,
     device: torch.device,
 ) -> torch.Tensor:
     q_positions = torch.arange(q_len, device=device, dtype=torch.int64)
@@ -550,11 +637,105 @@ def _fully_masked_row_mask_for_k1(
         q_block_idx,
     )
     q_abs = q_positions + int(topk_metadata.q_abs_offset)
+    selected_start = torch.where(selected >= 0, selected * int(k_block), -1)
     has_valid = (
         (selected >= 0)
-        & (selected <= q_abs.view(1, q_len, 1))
+        & (selected_start <= q_abs.view(1, q_len, 1))
     ).any(dim=-1)
     return (~has_valid).transpose(0, 1).contiguous()
+
+
+def _fully_masked_row_mask_for_k1(
+    *,
+    topk_metadata: SparseTopKBlockMetadata,
+    q_len: int,
+    q_block: int,
+    device: torch.device,
+) -> torch.Tensor:
+    return _fully_masked_row_mask(
+        topk_metadata=topk_metadata,
+        q_len=q_len,
+        q_block=q_block,
+        k_block=1,
+        device=device,
+    )
+
+
+def _log_fully_masked_row_debug(
+    *,
+    topk_metadata: SparseTopKBlockMetadata,
+    q_len: int,
+    seq_len: int,
+    cfg: SparsePrefillTopKConfig,
+    paged_kv: bool,
+    layer: object | None,
+) -> None:
+    if not _is_sparse_prefill_fully_masked_row_debug_enabled():
+        return
+
+    fully_masked = _fully_masked_row_mask(
+        topk_metadata=topk_metadata,
+        q_len=q_len,
+        q_block=int(cfg.q_block),
+        k_block=int(cfg.k_block),
+        device=topk_metadata.topk_block_indices.device,
+    )
+    masked_rows = int(fully_masked.sum().item())
+    total_rows = int(fully_masked.numel())
+    masked_token_rows = fully_masked.any(dim=1)
+    masked_tokens = int(masked_token_rows.sum().item())
+    sample_payload = "[]"
+
+    if masked_rows > 0:
+        q_positions = torch.arange(q_len, device=fully_masked.device, dtype=torch.int64)
+        q_block_idx = torch.div(q_positions, int(cfg.q_block), rounding_mode="floor")
+        q_abs = q_positions + int(topk_metadata.q_abs_offset)
+        sample_parts: list[str] = []
+        masked_pos, masked_heads = fully_masked.nonzero(as_tuple=True)
+        sample_count = min(8, int(masked_pos.numel()))
+        for sample_idx in range(sample_count):
+            q_pos = int(masked_pos[sample_idx].item())
+            head_idx = int(masked_heads[sample_idx].item())
+            q_blk = int(q_block_idx[q_pos].item())
+            keep_count = int(topk_metadata.topk_block_counts[head_idx, q_blk].item())
+            selected_blocks = [
+                int(v)
+                for v in topk_metadata.topk_block_indices[
+                    head_idx, q_blk, :keep_count
+                ].tolist()
+            ]
+            sample_parts.append(
+                "q=%d abs=%d h=%d qb=%d sel=%s"
+                % (
+                    q_pos,
+                    int(q_abs[q_pos].item()),
+                    head_idx,
+                    q_blk,
+                    selected_blocks,
+                )
+            )
+        sample_payload = "[" + "; ".join(sample_parts) + "]"
+
+    layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
+    selection_policy = format_sparse_prefill_selection_policy(cfg)
+    logger.info(
+        "Sparse prefill fully-masked-row debug: layer_idx=%s layer_name=%s "
+        "q_len=%d seq_len=%d path=%s q_block=%d k_block=%d %s "
+        "masked_rows=%d/%d masked_tokens=%d/%d sample=%s.",
+        layer_idx if layer_idx is not None else "NA",
+        layer_name or "unknown",
+        int(q_len),
+        int(seq_len),
+        "paged" if paged_kv else "contiguous",
+        int(cfg.q_block),
+        int(cfg.k_block),
+        selection_policy,
+        masked_rows,
+        total_rows,
+        masked_tokens,
+        int(q_len),
+        sample_payload,
+    )
 
 
 def _gather_paged_value_mean(
@@ -1463,12 +1644,13 @@ def _log_triton_retain_score_stats(
         return
     layer_idx = None
     layer_name = None
+    selection_policy = format_sparse_prefill_selection_policy(cfg)
     if should_log_sparse_prefill_layer_info(retain_score_log_mode):
         layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
         logger.info(
             "Sparse prefill Triton retain-score stats: layer_idx=%s "
             "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
-            "topk=%d avg_retain_score=%.6f density=%.6f valid_rows=%d "
+            "%s avg_retain_score=%.6f density=%.6f valid_rows=%d "
             "kept_blocks=%d valid_blocks=%d.",
             layer_idx if layer_idx is not None else "NA",
             layer_name or "unknown",
@@ -1477,7 +1659,7 @@ def _log_triton_retain_score_stats(
             "paged" if paged_kv else "contiguous",
             int(cfg.q_block),
             int(cfg.k_block),
-            int(cfg.topk),
+            selection_policy,
             selection_stats.retained_attention_score_mean,
             selection_stats.density,
             selection_stats.total_valid_rows,
@@ -1487,14 +1669,14 @@ def _log_triton_retain_score_stats(
     else:
         logger.info(
             "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
-            "path=%s q_block=%d k_block=%d topk=%d avg_retain_score=%.6f "
+            "path=%s q_block=%d k_block=%d %s avg_retain_score=%.6f "
             "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
             int(query_len),
             int(seq_len),
             "paged" if paged_kv else "contiguous",
             int(cfg.q_block),
             int(cfg.k_block),
-            int(cfg.topk),
+            selection_policy,
             selection_stats.retained_attention_score_mean,
             selection_stats.density,
             selection_stats.total_valid_rows,
@@ -1506,7 +1688,7 @@ def _log_triton_retain_score_stats(
         logger.info(
             "Sparse prefill Triton retain-score per-head stats: layer_idx=%s "
             "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
-            "topk=%d num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
+            "%s num_heads=%d retain_scores=%s densities=%s valid_rows=%s "
             "kept_blocks=%s valid_blocks=%s.",
             layer_idx if layer_idx is not None else "NA",
             layer_name or "unknown",
@@ -1515,7 +1697,7 @@ def _log_triton_retain_score_stats(
             "paged" if paged_kv else "contiguous",
             int(cfg.q_block),
             int(cfg.k_block),
-            int(cfg.topk),
+            selection_policy,
             len(selection_stats.per_head_total_valid_rows),
             per_head_payload["retain_scores"],
             per_head_payload["densities"],
@@ -1607,6 +1789,14 @@ def run_triton_sparse_prefill_attention(
             selection_stats=selection_stats_for_log,
             retain_score_log_mode=resolved_log_mode,
         )
+        _log_fully_masked_row_debug(
+            topk_metadata=topk_metadata,
+            q_len=int(query.shape[0]),
+            seq_len=int(seq_len),
+            cfg=cfg,
+            paged_kv=True,
+            layer=layer,
+        )
         output = _launch_paged_sparse_attention(
             query=query,
             kv_cache=kv_cache,
@@ -1673,6 +1863,14 @@ def run_triton_sparse_prefill_attention(
         paged_kv=False,
         selection_stats=topk_metadata.selection_stats,
         retain_score_log_mode=resolved_log_mode,
+    )
+    _log_fully_masked_row_debug(
+        topk_metadata=topk_metadata,
+        q_len=int(query.shape[0]),
+        seq_len=int(key.shape[0]),
+        cfg=cfg,
+        paged_kv=False,
+        layer=layer,
     )
     output = _launch_contiguous_sparse_attention(
         query=query,

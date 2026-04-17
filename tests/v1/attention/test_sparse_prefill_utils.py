@@ -21,8 +21,10 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     SparsePrefillTopKConfig,
     _select_topk_sparse_blocks,
+    _select_threshold_sparse_blocks,
     _reconstruct_sequence_slots,
     gather_full_sequence_kv_from_paged_cache,
+    format_sparse_prefill_selection_policy,
     get_sparse_prefill_impl_mode,
     get_sparse_prefill_retain_score_log_mode,
     get_sparse_prefill_topk_config,
@@ -183,9 +185,12 @@ def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path
     assert cfg.q_block == 16
     assert cfg.k_block == 16
     assert cfg.topk == 128
+    assert cfg.threshold is None
     assert cfg.sink_block == 0
     assert cfg.sliding_window_block == 0
+    assert cfg.q_pooling == "mean_before"
     assert cfg.max_selected_blocks == 128
+    assert format_sparse_prefill_selection_policy(cfg) == "topk=128"
 
 
 def test_get_sparse_prefill_topk_config_parses_sink_and_sliding_window_blocks(
@@ -217,9 +222,68 @@ def test_get_sparse_prefill_topk_config_parses_sink_and_sliding_window_blocks(
     assert cfg.q_block == 256
     assert cfg.k_block == 1
     assert cfg.topk == 2048
+    assert cfg.threshold is None
     assert cfg.sink_block == 4
     assert cfg.sliding_window_block == 128
+    assert cfg.q_pooling == "mean_before"
     assert cfg.max_selected_blocks == 2180
+
+
+def test_get_sparse_prefill_topk_config_parses_mean_after_q_pooling(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_28": {
+                    "name": "q_256_after_k_1_topk_2048",
+                    "q_block": 256,
+                    "k_block": 1,
+                    "topk": 2048,
+                    "q_pooling": "mean_after",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_28")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.q_pooling == "mean_after"
+    assert cfg.k_block == 1
+
+
+def test_get_sparse_prefill_topk_config_parses_threshold_scheme(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_32": {
+                    "name": "q_16_k_16_threshold_0.95",
+                    "q_block": 16,
+                    "k_block": 16,
+                    "threshold": 0.95,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_32")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.topk is None
+    assert cfg.threshold == pytest.approx(0.95)
+    assert cfg.max_selected_blocks == 0
+    assert format_sparse_prefill_selection_policy(cfg) == "threshold=0.95"
 
 
 @pytest.mark.parametrize("field_name", ["sink_block", "sliding_window_block"])
@@ -245,6 +309,56 @@ def test_get_sparse_prefill_topk_config_rejects_negative_sink_or_window_blocks(
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
 
     with pytest.raises(ValueError, match=rf"Sparse scheme field '{field_name}'.*>= 0"):
+        get_sparse_prefill_topk_config()
+
+
+def test_get_sparse_prefill_topk_config_rejects_invalid_q_pooling(monkeypatch, tmp_path):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_bad": {
+                    "name": "bad_sparse",
+                    "q_block": 16,
+                    "k_block": 1,
+                    "topk": 32,
+                    "q_pooling": "median_after",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
+
+    with pytest.raises(ValueError, match="field 'q_pooling' must be one of"):
+        get_sparse_prefill_topk_config()
+
+
+def test_get_sparse_prefill_topk_config_rejects_mean_after_without_k1(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_bad": {
+                    "name": "bad_sparse",
+                    "q_block": 16,
+                    "k_block": 4,
+                    "topk": 32,
+                    "q_pooling": "mean_after",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
+
+    with pytest.raises(ValueError, match="requires 'k_block' == 1"):
         get_sparse_prefill_topk_config()
 
 
@@ -411,6 +525,100 @@ def test_select_topk_sparse_blocks_keeps_block_zero_when_counts_below_topk():
     assert keep_mask.tolist() == [[[[True, True, True, True, False, False]]]]
 
 
+def test_select_threshold_sparse_blocks_keeps_minimal_mass_prefix():
+    block_probs = torch.tensor([[[[0.45, 0.30, 0.15, 0.10]]]], dtype=torch.float32)
+    valid_block_mask = torch.ones_like(block_probs, dtype=torch.bool)
+
+    keep_mask = _select_threshold_sparse_blocks(
+        block_probs,
+        valid_block_mask,
+        required_mass=torch.tensor([[[[0.75]]]], dtype=torch.float32),
+    )
+
+    assert keep_mask.tolist() == [[[[True, True, False, False]]]]
+
+
+def test_build_sparse_topk_block_metadata_threshold_accounts_for_mandatory_blocks():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=4,
+        k_block=1,
+        threshold=0.95,
+        sink_block=1,
+        sliding_window_block=1,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor([[[[0.0], [1.0], [2.0], [4.0]]]], dtype=torch.float32)
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=4,
+        record_selection_stats=True,
+    )
+
+    assert metadata.topk_block_indices.shape == (1, 1, 3)
+    assert metadata.topk_block_counts.tolist() == [[3]]
+    assert metadata.topk_block_indices[0, 0].tolist() == [0, 2, 3]
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_kept_blocks == 3
+
+
+def test_build_sparse_topk_block_metadata_mean_after_changes_first_block_selection():
+    query = torch.tensor(
+        [
+            [[2.0, 0.0]],
+            [[0.0, 4.0]],
+            [[1.0, 0.0]],
+            [[1.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    pooled_key = torch.tensor(
+        [[[[3.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]]],
+        dtype=torch.float32,
+    )
+    mean_before_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        q_pooling="mean_before",
+    )
+    mean_after_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        q_pooling="mean_after",
+    )
+
+    before = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=mean_before_cfg,
+        k_len=4,
+    )
+    after = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=mean_after_cfg,
+        k_len=4,
+    )
+
+    assert before.topk_block_counts.tolist() == [[1, 1]]
+    assert after.topk_block_counts.tolist() == [[1, 1]]
+    assert before.topk_block_indices[0, 0, 0].item() == 0
+    assert after.topk_block_indices[0, 0, 0].item() == 1
+
+
 @pytest.mark.parametrize(
     ("retain_score_log_mode", "expect_layer", "expect_per_head"),
     [
@@ -484,9 +692,60 @@ def test_run_sparse_prefill_attention_logs_retain_score_by_mode(
             "retain_scores=[0.940399]" in per_head_messages[0]
             and "densities=[0.666667]" in per_head_messages[0]
             and "valid_rows=[2]" in per_head_messages[0]
+            and "topk=1" in per_head_messages[0]
         )
     else:
         assert not per_head_messages
+    assert "topk=1" in summary_messages[0]
+
+
+def test_run_sparse_prefill_attention_logs_threshold_policy(monkeypatch):
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=2,
+        threshold=0.95,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    key = torch.tensor([[[0.0]], [[1.0]], [[2.0]], [[3.0]]], dtype=torch.float32)
+    value = key.clone()
+
+    logged: list[str] = []
+
+    def _capture_info(message: str, *args):
+        logged.append(message % args)
+
+    monkeypatch.setattr(sparse_prefill_utils_module.logger, "info", _capture_info)
+
+    run_sparse_prefill_attention(
+        query=query,
+        key=key,
+        value=value,
+        scaling=1.0,
+        cfg=cfg,
+        output_dtype=torch.float32,
+        record_retain_score=True,
+        retain_score_log_mode="head",
+    )
+
+    summary_messages = [
+        message
+        for message in logged
+        if message.startswith("Sparse prefill torch retain-score stats:")
+    ]
+    per_head_messages = [
+        message
+        for message in logged
+        if message.startswith("Sparse prefill torch retain-score per-head stats:")
+    ]
+
+    assert len(summary_messages) == 1
+    assert len(per_head_messages) == 1
+    assert "threshold=0.95" in summary_messages[0]
+    assert "threshold=0.95" in per_head_messages[0]
+    assert "topk=" not in summary_messages[0]
+    assert "topk=" not in per_head_messages[0]
 
 
 def test_sparse_output_nan_check_accepts_finite_output():
@@ -517,15 +776,42 @@ def test_sparse_output_nan_check_rejects_nan_output():
         )
 
 
-def test_get_sparse_prefill_topk_config_rejects_non_topk_scheme(monkeypatch, tmp_path):
+def test_get_sparse_prefill_topk_config_rejects_missing_selection_policy(
+    monkeypatch, tmp_path
+):
     sparse_json = tmp_path / "sparse.json"
     sparse_json.write_text(
         json.dumps(
             {
                 "sparse_v1": {
-                    "name": "q_16_k_16_threshold_0.95",
+                    "name": "q_16_k_16_invalid",
                     "q_block": 16,
                     "k_block": 16,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_v1")
+
+    with pytest.raises(ValueError, match="must define exactly one of 'topk' or 'threshold'"):
+        get_sparse_prefill_topk_config()
+
+
+def test_get_sparse_prefill_topk_config_rejects_multiple_selection_policies(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_v1": {
+                    "name": "q_16_k_16_invalid",
+                    "q_block": 16,
+                    "k_block": 16,
+                    "topk": 32,
                     "threshold": 0.95,
                 }
             }
@@ -536,7 +822,7 @@ def test_get_sparse_prefill_topk_config_rejects_non_topk_scheme(monkeypatch, tmp
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_v1")
 
-    with pytest.raises(ValueError, match="Only topk sparse schemes are supported"):
+    with pytest.raises(ValueError, match="must define exactly one of 'topk' or 'threshold'"):
         get_sparse_prefill_topk_config()
 
 
