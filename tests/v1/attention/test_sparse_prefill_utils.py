@@ -19,6 +19,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_VLLM_SPARSE_ENABLE_ENV,
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
+    SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _select_topk_sparse_blocks,
     _select_threshold_sparse_blocks,
@@ -35,7 +36,9 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     resolve_sparse_prefill_layer_info,
     run_sparse_prefill_attention,
 )
+from vllm.v1.attention.ops import triton_sparse_prefill as triton_sparse_prefill_module
 from vllm.v1.attention.ops.triton_sparse_prefill import (
+    _log_triton_retain_score_stats,
     build_sparse_topk_block_metadata,
 )
 
@@ -746,6 +749,51 @@ def test_run_sparse_prefill_attention_logs_threshold_policy(monkeypatch):
     assert "threshold=0.95" in per_head_messages[0]
     assert "topk=" not in summary_messages[0]
     assert "topk=" not in per_head_messages[0]
+
+
+def test_log_triton_retain_score_stats_logs_approx_and_exact(monkeypatch):
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=16,
+        k_block=16,
+        threshold=0.9,
+    )
+    approx_stats = SparsePrefillSelectionStats(
+        total_valid_blocks=10,
+        total_kept_blocks=5,
+        total_valid_rows=2,
+        retained_attention_score_sum=1.8,
+    )
+    exact_stats = SparsePrefillSelectionStats(
+        total_valid_blocks=10,
+        total_kept_blocks=5,
+        total_valid_rows=2,
+        retained_attention_score_sum=1.96,
+    )
+
+    logged: list[str] = []
+
+    def _capture_info(message: str, *args):
+        logged.append(message % args)
+
+    monkeypatch.setattr(triton_sparse_prefill_module.logger, "info", _capture_info)
+
+    _log_triton_retain_score_stats(
+        layer=None,
+        query_len=32,
+        seq_len=64,
+        cfg=cfg,
+        paged_kv=True,
+        selection_stats=exact_stats,
+        approx_selection_stats=approx_stats,
+        retain_score_log_mode="summary",
+    )
+
+    assert len(logged) == 1
+    assert "threshold=0.9" in logged[0]
+    assert "approx_retain_mass=0.900000" in logged[0]
+    assert "avg_retain_score=0.980000" in logged[0]
 
 
 def test_sparse_output_nan_check_accepts_finite_output():

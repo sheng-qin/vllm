@@ -1638,19 +1638,23 @@ def _log_triton_retain_score_stats(
     cfg: SparsePrefillTopKConfig,
     paged_kv: bool,
     selection_stats: SparsePrefillSelectionStats | None,
+    approx_selection_stats: SparsePrefillSelectionStats | None = None,
     retain_score_log_mode: SparsePrefillRetainScoreLogMode,
 ) -> None:
     if selection_stats is None:
         return
+    if approx_selection_stats is None:
+        approx_selection_stats = selection_stats
     layer_idx = None
     layer_name = None
     selection_policy = format_sparse_prefill_selection_policy(cfg)
+    approx_retain_mass = approx_selection_stats.retained_attention_score_mean
     if should_log_sparse_prefill_layer_info(retain_score_log_mode):
         layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
         logger.info(
             "Sparse prefill Triton retain-score stats: layer_idx=%s "
             "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
-            "%s avg_retain_score=%.6f density=%.6f valid_rows=%d "
+            "%s approx_retain_mass=%.6f avg_retain_score=%.6f density=%.6f valid_rows=%d "
             "kept_blocks=%d valid_blocks=%d.",
             layer_idx if layer_idx is not None else "NA",
             layer_name or "unknown",
@@ -1660,6 +1664,7 @@ def _log_triton_retain_score_stats(
             int(cfg.q_block),
             int(cfg.k_block),
             selection_policy,
+            approx_retain_mass,
             selection_stats.retained_attention_score_mean,
             selection_stats.density,
             selection_stats.total_valid_rows,
@@ -1669,7 +1674,7 @@ def _log_triton_retain_score_stats(
     else:
         logger.info(
             "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
-            "path=%s q_block=%d k_block=%d %s avg_retain_score=%.6f "
+            "path=%s q_block=%d k_block=%d %s approx_retain_mass=%.6f avg_retain_score=%.6f "
             "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
             int(query_len),
             int(seq_len),
@@ -1677,6 +1682,7 @@ def _log_triton_retain_score_stats(
             int(cfg.q_block),
             int(cfg.k_block),
             selection_policy,
+            approx_retain_mass,
             selection_stats.retained_attention_score_mean,
             selection_stats.density,
             selection_stats.total_valid_rows,
@@ -1755,7 +1761,8 @@ def run_triton_sparse_prefill_attention(
             record_selection_stats=resolved_log_mode != "off",
             breakdown=timing_breakdown,
         )
-        selection_stats_for_log = topk_metadata.selection_stats
+        approx_selection_stats_for_log = topk_metadata.selection_stats
+        selection_stats_for_log = approx_selection_stats_for_log
         should_compute_token_retain = (
             resolved_log_mode != "off"
             and topk_metadata.selection_stats is not None
@@ -1787,6 +1794,7 @@ def run_triton_sparse_prefill_attention(
             cfg=cfg,
             paged_kv=True,
             selection_stats=selection_stats_for_log,
+            approx_selection_stats=approx_selection_stats_for_log,
             retain_score_log_mode=resolved_log_mode,
         )
         _log_fully_masked_row_debug(
@@ -1850,7 +1858,7 @@ def run_triton_sparse_prefill_attention(
         < topk_metadata.selection_stats.total_valid_blocks
     ):
         logger.info(
-            "contiguous retain score not computed "
+            "contiguous exact retain score not computed "
             "(kept_blocks=%d < valid_blocks=%d)",
             topk_metadata.selection_stats.total_kept_blocks,
             topk_metadata.selection_stats.total_valid_blocks,
@@ -1862,6 +1870,7 @@ def run_triton_sparse_prefill_attention(
         cfg=cfg,
         paged_kv=False,
         selection_stats=topk_metadata.selection_stats,
+        approx_selection_stats=topk_metadata.selection_stats,
         retain_score_log_mode=resolved_log_mode,
     )
     _log_fully_masked_row_debug(
