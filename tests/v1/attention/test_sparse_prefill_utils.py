@@ -40,6 +40,7 @@ from vllm.v1.attention.ops import triton_sparse_prefill as triton_sparse_prefill
 from vllm.v1.attention.ops.triton_sparse_prefill import (
     _log_triton_retain_score_stats,
     build_sparse_topk_block_metadata,
+    build_sparse_topk_block_metadata_from_paged_cache,
 )
 
 
@@ -260,6 +261,34 @@ def test_get_sparse_prefill_topk_config_parses_mean_after_q_pooling(
     assert cfg.k_block == 1
 
 
+def test_get_sparse_prefill_topk_config_parses_xattn_scheme(monkeypatch, tmp_path):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_46": {
+                    "name": "q_64_k_16_topk_128_xattn",
+                    "q_block": 64,
+                    "k_block": 16,
+                    "topk": 128,
+                    "xattn": True,
+                    "xattn_stride": 8,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_46")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.xattn is True
+    assert cfg.xattn_stride == 8
+    assert format_sparse_prefill_selection_policy(cfg) == "topk=128,xattn_stride=8"
+
+
 def test_get_sparse_prefill_topk_config_parses_threshold_scheme(
     monkeypatch, tmp_path
 ):
@@ -363,6 +392,59 @@ def test_get_sparse_prefill_topk_config_rejects_mean_after_without_k1(
 
     with pytest.raises(ValueError, match="requires 'k_block' == 1"):
         get_sparse_prefill_topk_config()
+
+
+def test_get_sparse_prefill_topk_config_rejects_xattn_stride_without_xattn(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_bad": {
+                    "name": "bad_sparse",
+                    "q_block": 64,
+                    "k_block": 16,
+                    "topk": 128,
+                    "xattn_stride": 8,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
+
+    with pytest.raises(ValueError, match="xattn_stride' requires 'xattn'=true"):
+        get_sparse_prefill_topk_config()
+
+
+def test_sparse_prefill_topk_config_rejects_xattn_mean_after():
+    with pytest.raises(ValueError, match="xattn configs currently require"):
+        SparsePrefillTopKConfig(
+            key="test_sparse",
+            name="test_sparse",
+            q_block=64,
+            k_block=1,
+            topk=128,
+            q_pooling="mean_after",
+            xattn=True,
+            xattn_stride=8,
+        )
+
+
+def test_sparse_prefill_topk_config_rejects_xattn_stride_not_dividing_blocks():
+    with pytest.raises(ValueError, match="k_block=16 must be divisible"):
+        SparsePrefillTopKConfig(
+            key="test_sparse",
+            name="test_sparse",
+            q_block=60,
+            k_block=16,
+            topk=128,
+            xattn=True,
+            xattn_stride=6,
+        )
 
 
 def test_build_sparse_topk_block_metadata_records_retained_attention_score():
@@ -620,6 +702,84 @@ def test_build_sparse_topk_block_metadata_mean_after_changes_first_block_selecti
     assert after.topk_block_counts.tolist() == [[1, 1]]
     assert before.topk_block_indices[0, 0, 0].item() == 0
     assert after.topk_block_indices[0, 0, 0].item() == 1
+
+
+def test_build_sparse_topk_block_metadata_supports_xattn_asymmetric_blocks():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=4,
+        k_block=2,
+        topk=1,
+        xattn=True,
+        xattn_stride=2,
+    )
+    query = torch.ones((8, 1, 1), dtype=torch.float32)
+    key = torch.tensor(
+        [[[0.0]], [[0.0]], [[1.0]], [[1.0]], [[2.0]], [[2.0]], [[3.0]], [[3.0]]],
+        dtype=torch.float32,
+    )
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        key=key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=8,
+        record_selection_stats=True,
+    )
+
+    assert metadata.topk_block_indices.shape == (1, 2, 1)
+    assert metadata.topk_block_counts.tolist() == [[1, 1]]
+    assert metadata.topk_block_indices[0, 0, 0].item() == 1
+    assert metadata.topk_block_indices[0, 1, 0].item() == 3
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_valid_blocks == 6
+    assert metadata.selection_stats.total_kept_blocks == 2
+
+
+def test_build_sparse_topk_block_metadata_from_paged_cache_supports_xattn():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=4,
+        k_block=2,
+        topk=1,
+        xattn=True,
+        xattn_stride=2,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    full_key = torch.tensor(
+        [[[0.0]], [[0.0]], [[1.0]], [[1.0]], [[2.0]], [[2.0]], [[3.0]], [[3.0]]],
+        dtype=torch.float32,
+    )
+    full_value = full_key.clone()
+    block_table_row = torch.tensor([1, 0, 3, 2], dtype=torch.int32)
+    kv_cache = torch.zeros((2, 4, 2, 1, 1), dtype=torch.float32)
+    for logical_block in range(4):
+        physical_block = int(block_table_row[logical_block].item())
+        start = logical_block * 2
+        end = start + 2
+        kv_cache[0, physical_block, :2].copy_(full_key[start:end])
+        kv_cache[1, physical_block, :2].copy_(full_value[start:end])
+
+    metadata = build_sparse_topk_block_metadata_from_paged_cache(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=8,
+        scaling=1.0,
+        kv_cache_dtype="auto",
+        cfg=cfg,
+        record_selection_stats=True,
+    )
+
+    assert metadata.topk_block_indices.shape == (1, 1, 1)
+    assert metadata.topk_block_counts.tolist() == [[1]]
+    assert metadata.topk_block_indices[0, 0, 0].item() == 3
+    assert metadata.selection_stats is not None
+    assert metadata.selection_stats.total_valid_blocks == 4
+    assert metadata.selection_stats.total_kept_blocks == 1
 
 
 @pytest.mark.parametrize(

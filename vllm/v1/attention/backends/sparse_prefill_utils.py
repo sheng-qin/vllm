@@ -43,6 +43,8 @@ class SparsePrefillTopKConfig:
     sink_block: int = 0
     sliding_window_block: int = 0
     q_pooling: SparsePrefillQPoolingMode = "mean_before"
+    xattn: bool = False
+    xattn_stride: int | None = None
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
 
     def __post_init__(self) -> None:
@@ -83,6 +85,34 @@ class SparsePrefillTopKConfig:
                 "Sparse scheme field 'q_pooling'='mean_after' currently requires "
                 "'k_block' == 1."
             )
+        if self.xattn:
+            if self.q_pooling != "mean_before":
+                raise ValueError(
+                    "Sparse xattn configs currently require "
+                    "'q_pooling'='mean_before'."
+                )
+            if self.xattn_stride is None:
+                raise ValueError(
+                    "Sparse xattn configs require a positive 'xattn_stride'."
+                )
+            if self.xattn_stride <= 0:
+                raise ValueError(
+                    f"xattn_stride must be > 0, got {self.xattn_stride}."
+                )
+            if self.q_block % self.xattn_stride != 0:
+                raise ValueError(
+                    f"q_block={self.q_block} must be divisible by "
+                    f"xattn_stride={self.xattn_stride}."
+                )
+            if self.k_block % self.xattn_stride != 0:
+                raise ValueError(
+                    f"k_block={self.k_block} must be divisible by "
+                    f"xattn_stride={self.xattn_stride}."
+                )
+        elif self.xattn_stride is not None:
+            raise ValueError(
+                "Sparse scheme field 'xattn_stride' requires 'xattn'=true."
+            )
 
     @property
     def selection_mode(self) -> SparsePrefillSelectionMode:
@@ -96,8 +126,12 @@ class SparsePrefillTopKConfig:
 
 def format_sparse_prefill_selection_policy(cfg: SparsePrefillTopKConfig) -> str:
     if cfg.threshold is not None:
-        return f"threshold={cfg.threshold:g}"
-    return f"topk={cfg.topk}"
+        policy = f"threshold={cfg.threshold:g}"
+    else:
+        policy = f"topk={cfg.topk}"
+    if cfg.xattn:
+        policy = f"{policy},xattn_stride={cfg.xattn_stride}"
+    return policy
 
 
 @dataclass(frozen=True)
@@ -359,6 +393,14 @@ def _require_probability(value: object, field_name: str) -> float:
     return value_f
 
 
+def _parse_sparse_prefill_xattn_flag(value: object) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("Sparse scheme field 'xattn' must be a boolean.")
+    return value
+
+
 def _parse_sparse_prefill_q_pooling(value: object) -> SparsePrefillQPoolingMode:
     if value is None:
         return "mean_before"
@@ -426,6 +468,13 @@ def _load_sparse_prefill_topk_config(
         else None
     )
     q_pooling = _parse_sparse_prefill_q_pooling(scheme.get("q_pooling"))
+    xattn = _parse_sparse_prefill_xattn_flag(scheme.get("xattn"))
+    xattn_stride_value = scheme.get("xattn_stride")
+    xattn_stride = (
+        _require_positive_int(xattn_stride_value, "xattn_stride")
+        if xattn_stride_value is not None
+        else None
+    )
 
     return SparsePrefillTopKConfig(
         key=key,
@@ -443,6 +492,8 @@ def _load_sparse_prefill_topk_config(
             "sliding_window_block",
         ),
         q_pooling=q_pooling,
+        xattn=xattn,
+        xattn_stride=xattn_stride,
     )
 
 
@@ -732,6 +783,176 @@ def _block_validity_from_token_mask(
     return allowed_blocks.any(dim=-1).any(dim=3)
 
 
+def _reshape_xattn_sequence(
+    x: torch.Tensor,
+    *,
+    stride: int,
+    reverse: bool,
+) -> tuple[torch.Tensor, int]:
+    if stride <= 0:
+        raise ValueError(f"stride must be > 0, got {stride}.")
+
+    batch_size, num_heads, seq_len, head_dim = x.shape
+    reduced_len = math.ceil(seq_len / stride)
+    pad = reduced_len * stride - seq_len
+    x_f = x.to(torch.float32)
+    if pad > 0:
+        x_f = F.pad(x_f, (0, 0, 0, pad))
+
+    offsets = range(stride - 1, -1, -1) if reverse else range(stride)
+    pieces = [x_f[:, :, offset::stride, :] for offset in offsets]
+    reshaped = torch.cat(pieces, dim=-1)
+    expected_shape = (batch_size, num_heads, reduced_len, head_dim * stride)
+    if reshaped.shape != expected_shape:
+        raise RuntimeError(
+            "Unexpected xattn reshaped state shape, expected "
+            f"{expected_shape} but got {tuple(reshaped.shape)}."
+        )
+    return reshaped, reduced_len
+
+
+def _expand_head_mask(mask: torch.Tensor, num_heads: int) -> torch.Tensor:
+    if mask.shape[1] == num_heads:
+        return mask
+    if mask.shape[1] != 1:
+        raise ValueError(
+            f"Expected mask head dimension to be 1 or {num_heads}, got {mask.shape[1]}."
+        )
+    return mask.expand(mask.shape[0], num_heads, *mask.shape[2:])
+
+
+def _build_xattn_block_scores_and_probs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    scaling: float,
+    cfg: SparsePrefillTopKConfig,
+    reduced_valid_mask: torch.Tensor,
+    final_valid_block_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not cfg.xattn or cfg.xattn_stride is None:
+        raise ValueError("xattn score construction requires cfg.xattn_stride.")
+    if query.shape[1] != key.shape[1]:
+        raise ValueError(
+            "xattn score construction requires query and key to have the same "
+            f"number of heads, got {query.shape[1]} and {key.shape[1]}."
+        )
+
+    stride = int(cfg.xattn_stride)
+    batch_size, num_heads, q_len, _ = query.shape
+    k_len = key.shape[-2]
+    q_group = int(cfg.q_block) // stride
+    k_group = int(cfg.k_block) // stride
+    q_blocks = math.ceil(q_len / int(cfg.q_block))
+    k_blocks = math.ceil(k_len / int(cfg.k_block))
+
+    reshaped_query, q_reduced_len = _reshape_xattn_sequence(
+        query, stride=stride, reverse=True
+    )
+    reshaped_key, k_reduced_len = _reshape_xattn_sequence(
+        key, stride=stride, reverse=False
+    )
+    reduced_scores = torch.matmul(
+        reshaped_query, reshaped_key.transpose(-1, -2)
+    ) * (float(scaling) / float(stride))
+
+    reduced_valid_mask = _expand_head_mask(
+        reduced_valid_mask.to(device=query.device, dtype=torch.bool),
+        num_heads,
+    )
+    final_valid_block_mask = _expand_head_mask(
+        final_valid_block_mask.to(device=query.device, dtype=torch.bool),
+        num_heads,
+    )
+    if reduced_valid_mask.shape[-2:] != (q_reduced_len, k_reduced_len):
+        raise ValueError(
+            "Unexpected reduced_valid_mask shape for xattn, got "
+            f"{tuple(reduced_valid_mask.shape)} expected "
+            f"(*, {q_reduced_len}, {k_reduced_len})."
+        )
+    if final_valid_block_mask.shape[-2:] != (q_blocks, k_blocks):
+        raise ValueError(
+            "Unexpected final_valid_block_mask shape for xattn, got "
+            f"{tuple(final_valid_block_mask.shape)} expected "
+            f"(*, {q_blocks}, {k_blocks})."
+        )
+
+    neg_large = torch.full_like(reduced_scores, -1e30)
+    masked_reduced_scores = torch.where(reduced_valid_mask, reduced_scores, neg_large)
+    reduced_row_has_valid = reduced_valid_mask.any(dim=-1, keepdim=True)
+    reduced_probs = torch.where(
+        reduced_row_has_valid,
+        torch.softmax(masked_reduced_scores, dim=-1),
+        torch.zeros_like(masked_reduced_scores),
+    )
+
+    q_pad = q_blocks * q_group - q_reduced_len
+    k_pad = k_blocks * k_group - k_reduced_len
+    if q_pad < 0 or k_pad < 0:
+        raise ValueError(
+            "xattn reduced grid exceeded configured block layout with "
+            f"q_pad={q_pad}, k_pad={k_pad}."
+        )
+
+    score_values = torch.where(
+        reduced_valid_mask,
+        reduced_scores,
+        torch.zeros_like(reduced_scores),
+    )
+    valid_pad = reduced_valid_mask.to(torch.uint8)
+    query_row_valid = torch.ones(
+        (batch_size, num_heads, q_reduced_len),
+        device=query.device,
+        dtype=torch.uint8,
+    )
+    if q_pad > 0 or k_pad > 0:
+        score_values = F.pad(score_values, (0, k_pad, 0, q_pad), value=0.0)
+        reduced_probs = F.pad(reduced_probs, (0, k_pad, 0, q_pad), value=0.0)
+        valid_pad = F.pad(valid_pad, (0, k_pad, 0, q_pad), value=0)
+        query_row_valid = F.pad(query_row_valid, (0, q_pad), value=0)
+
+    score_blocks = score_values.contiguous().view(
+        batch_size, num_heads, q_blocks, q_group, k_blocks, k_group
+    )
+    prob_blocks = reduced_probs.contiguous().view(
+        batch_size, num_heads, q_blocks, q_group, k_blocks, k_group
+    )
+    valid_blocks = valid_pad.to(torch.bool).contiguous().view(
+        batch_size, num_heads, q_blocks, q_group, k_blocks, k_group
+    )
+    q_row_valid_blocks = query_row_valid.to(torch.bool).contiguous().view(
+        batch_size, num_heads, q_blocks, q_group
+    )
+
+    block_score_counts = valid_blocks.sum(dim=5).sum(dim=3)
+    block_scores = torch.where(
+        valid_blocks,
+        score_blocks,
+        torch.zeros_like(score_blocks),
+    ).sum(dim=5).sum(dim=3)
+    block_scores = block_scores / block_score_counts.to(torch.float32).clamp_min(1.0)
+
+    q_row_counts = q_row_valid_blocks.sum(dim=3).to(torch.float32).clamp_min(1.0)
+    block_probs = torch.where(
+        valid_blocks,
+        prob_blocks,
+        torch.zeros_like(prob_blocks),
+    ).sum(dim=5).sum(dim=3)
+    block_probs = block_probs / q_row_counts.unsqueeze(-1)
+
+    block_scores = torch.where(
+        final_valid_block_mask,
+        block_scores,
+        torch.zeros_like(block_scores),
+    )
+    block_probs = torch.where(
+        final_valid_block_mask,
+        block_probs,
+        torch.zeros_like(block_probs),
+    )
+    return block_scores, block_probs, final_valid_block_mask
+
+
 def _build_mandatory_sparse_block_mask(
     valid_block_mask: torch.Tensor,
     *,
@@ -981,55 +1202,83 @@ def _build_sparse_attention_mask_topk(
     mask_floor = torch.finfo(base_mask.dtype).min / 2
     allowed_token_mask = base_mask > mask_floor
 
-    pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
-    if cfg.q_pooling == "mean_after":
-        pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
-        block_score_rows: list[torch.Tensor] = []
-        valid_block_rows: list[torch.Tensor] = []
-
-        # Stream one q-block at a time to avoid materializing a full
-        # q_len x k_len token-score matrix for exact per-token query scoring.
-        for q_start in range(0, q_len, cfg.q_block):
-            q_end = min(q_start + int(cfg.q_block), q_len)
-            query_block = query[:, :, q_start:q_end, :].to(torch.float32)
-            token_scores = torch.matmul(query_block, pooled_key_t) * float(scaling)
-            block_token_mask = allowed_token_mask[:, :, q_start:q_end, :]
-            if cfg.k_block != 1:
-                block_token_mask = _block_validity_from_token_mask(
-                    block_token_mask,
-                    q_block=1,
-                    k_block=cfg.k_block,
-                )
-            block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
-                token_scores,
-                block_token_mask,
-                q_block=cfg.q_block,
-                q_pooling=cfg.q_pooling,
-            )
-            block_score_rows.append(block_scores_row)
-            valid_block_rows.append(valid_block_row)
-
-        block_scores = torch.cat(block_score_rows, dim=2)
-        valid_block_mask = torch.cat(valid_block_rows, dim=2)
-    elif cfg.q_pooling == "mean_before":
-        pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
-        block_scores = torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
-        valid_block_mask = _block_validity_from_token_mask(
+    block_probs = None
+    if cfg.xattn:
+        reduced_valid_mask = _block_validity_from_token_mask(
+            allowed_token_mask,
+            q_block=int(cfg.xattn_stride),
+            k_block=int(cfg.xattn_stride),
+        )
+        final_valid_block_mask = _block_validity_from_token_mask(
             allowed_token_mask,
             q_block=cfg.q_block,
             k_block=cfg.k_block,
         )
+        block_scores, block_probs, valid_block_mask = _build_xattn_block_scores_and_probs(
+            query,
+            key,
+            scaling=float(scaling),
+            cfg=cfg,
+            reduced_valid_mask=reduced_valid_mask,
+            final_valid_block_mask=final_valid_block_mask,
+        )
     else:
-        raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
+        pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
+        if cfg.q_pooling == "mean_after":
+            pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
+            block_score_rows: list[torch.Tensor] = []
+            valid_block_rows: list[torch.Tensor] = []
+
+            # Stream one q-block at a time to avoid materializing a full
+            # q_len x k_len token-score matrix for exact per-token query scoring.
+            for q_start in range(0, q_len, cfg.q_block):
+                q_end = min(q_start + int(cfg.q_block), q_len)
+                query_block = query[:, :, q_start:q_end, :].to(torch.float32)
+                token_scores = torch.matmul(query_block, pooled_key_t) * float(
+                    scaling
+                )
+                block_token_mask = allowed_token_mask[:, :, q_start:q_end, :]
+                if cfg.k_block != 1:
+                    block_token_mask = _block_validity_from_token_mask(
+                        block_token_mask,
+                        q_block=1,
+                        k_block=cfg.k_block,
+                    )
+                block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
+                    token_scores,
+                    block_token_mask,
+                    q_block=cfg.q_block,
+                    q_pooling=cfg.q_pooling,
+                )
+                block_score_rows.append(block_scores_row)
+                valid_block_rows.append(valid_block_row)
+
+            block_scores = torch.cat(block_score_rows, dim=2)
+            valid_block_mask = torch.cat(valid_block_rows, dim=2)
+        elif cfg.q_pooling == "mean_before":
+            pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
+            block_scores = (
+                torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
+            )
+            valid_block_mask = _block_validity_from_token_mask(
+                allowed_token_mask,
+                q_block=cfg.q_block,
+                k_block=cfg.k_block,
+            )
+        else:
+            raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
 
     masked_scores = torch.where(
         valid_block_mask,
         block_scores,
         torch.full_like(block_scores, -1e30),
     )
-    block_probs = torch.softmax(masked_scores, dim=-1)
-    row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
-    block_probs = torch.where(row_has_valid, block_probs, torch.zeros_like(block_probs))
+    if block_probs is None:
+        block_probs = torch.softmax(masked_scores, dim=-1)
+        row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
+        block_probs = torch.where(
+            row_has_valid, block_probs, torch.zeros_like(block_probs)
+        )
 
     keep_block_mask, _ = _merge_mandatory_and_sparse_blocks(
         masked_scores,

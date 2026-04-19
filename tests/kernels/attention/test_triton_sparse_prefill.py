@@ -29,6 +29,8 @@ def _make_cfg(
     sink_block: int = 0,
     sliding_window_block: int = 0,
     q_pooling: str = "mean_before",
+    xattn: bool = False,
+    xattn_stride: int | None = None,
 ) -> SparsePrefillTopKConfig:
     return SparsePrefillTopKConfig(
         key="test_sparse",
@@ -40,6 +42,8 @@ def _make_cfg(
         sink_block=sink_block,
         sliding_window_block=sliding_window_block,
         q_pooling=q_pooling,
+        xattn=xattn,
+        xattn_stride=xattn_stride,
     )
 
 
@@ -189,6 +193,65 @@ def test_triton_sparse_prefill_matches_pytorch_cached_prefix(
     )
     block_table_row = torch.tensor(
         [3, 0, 5, 1, 6, 4, 2],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_cache = _build_paged_kv_cache(
+        key=full_key,
+        value=full_value,
+        block_table_row=block_table_row,
+        cache_block_size=cache_block_size,
+    )
+
+    reference = run_sparse_prefill_attention(
+        query=query,
+        key=full_key,
+        value=full_value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+    output = run_triton_sparse_prefill_attention(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        kv_cache_dtype="auto",
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+
+    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_sparse_prefill_matches_pytorch_cached_prefix_xattn(
+    dtype: torch.dtype,
+):
+    torch.manual_seed(7)
+    seq_len = 96
+    query_len = 32
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    cache_block_size = 16
+    cfg = _make_cfg(
+        topk=4,
+        q_block=64,
+        k_block=16,
+        xattn=True,
+        xattn_stride=8,
+    )
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    full_value = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    block_table_row = torch.tensor(
+        [5, 1, 3, 0, 4, 2],
         device="cuda",
         dtype=torch.int32,
     )

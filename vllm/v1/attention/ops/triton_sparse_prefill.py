@@ -16,13 +16,16 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     SparsePrefillRetainScoreLogMode,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
+    _build_xattn_block_scores_and_probs,
     _keep_block_mask_to_block_indices,
     _merge_mandatory_and_sparse_blocks,
     _mean_pool_attention_blocks,
     _pool_query_scores_to_blocks,
+    _summarize_sparse_block_selection,
     build_sparse_prefill_selection_stats,
     format_sparse_prefill_selection_policy,
     format_sparse_prefill_per_head_payload,
+    gather_full_sequence_kv_from_paged_cache,
     resolve_sparse_prefill_layer_info,
     resolve_sparse_prefill_retain_score_log_mode,
     should_log_sparse_prefill_layer_info,
@@ -378,7 +381,8 @@ def _summarize_topk_block_selection(
 def build_sparse_topk_block_metadata(
     *,
     query: torch.Tensor,
-    pooled_key: torch.Tensor,
+    pooled_key: torch.Tensor | None = None,
+    key: torch.Tensor | None = None,
     scaling: float,
     cfg: SparsePrefillTopKConfig,
     k_len: int,
@@ -387,23 +391,90 @@ def build_sparse_topk_block_metadata(
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
-    if pooled_key.shape[1] != query_states.shape[1]:
-        if query_states.shape[1] % pooled_key.shape[1] != 0:
-            raise ValueError(
-                "Sparse Triton prefill requires query heads to be divisible "
-                f"by KV heads, got num_heads={query_states.shape[1]} and "
-                f"num_kv_heads={pooled_key.shape[1]}."
+    key_states = None
+    if key is not None:
+        key_states = key.transpose(0, 1).unsqueeze(0)
+        if key_states.shape[1] != query_states.shape[1]:
+            if query_states.shape[1] % key_states.shape[1] != 0:
+                raise ValueError(
+                    "Sparse Triton prefill requires query heads to be divisible "
+                    f"by KV heads, got num_heads={query_states.shape[1]} and "
+                    f"num_kv_heads={key_states.shape[1]}."
+                )
+            key_states = _timed_call(
+                breakdown,
+                "topk_repeat_kv_heads",
+                _repeat_kv_heads,
+                key_states,
+                query_states.shape[1] // key_states.shape[1],
             )
-        pooled_key = _timed_call(
+    if not cfg.xattn:
+        if pooled_key is None:
+            if key_states is None:
+                raise ValueError(
+                    "Sparse Triton prefill requires either pooled_key or key."
+                )
+            pooled_key = _timed_call(
+                breakdown,
+                "topk_pool_key_from_dense",
+                _mean_pool_attention_blocks,
+                key_states,
+                cfg.k_block,
+            )
+        if pooled_key.shape[1] != query_states.shape[1]:
+            if query_states.shape[1] % pooled_key.shape[1] != 0:
+                raise ValueError(
+                    "Sparse Triton prefill requires query heads to be divisible "
+                    f"by KV heads, got num_heads={query_states.shape[1]} and "
+                    f"num_kv_heads={pooled_key.shape[1]}."
+                )
+            pooled_key = _timed_call(
+                breakdown,
+                "topk_repeat_kv_heads",
+                _repeat_kv_heads,
+                pooled_key,
+                query_states.shape[1] // pooled_key.shape[1],
+            )
+    if cfg.xattn:
+        if key_states is None:
+            raise ValueError(
+                "Sparse Triton xattn score construction requires dense key states."
+            )
+        reduced_valid_mask = _timed_call(
             breakdown,
-            "topk_repeat_kv_heads",
-            _repeat_kv_heads,
-            pooled_key,
-            query_states.shape[1] // pooled_key.shape[1],
+            "topk_build_xattn_reduced_mask",
+            _build_causal_valid_block_mask,
+            q_len=query.shape[0],
+            k_len=k_len,
+            q_block=int(cfg.xattn_stride),
+            k_block=int(cfg.xattn_stride),
+            device=query.device,
         )
-    if cfg.q_pooling == "mean_after":
+        final_valid_block_mask = _timed_call(
+            breakdown,
+            "topk_build_mask",
+            _build_causal_valid_block_mask,
+            q_len=query.shape[0],
+            k_len=k_len,
+            q_block=cfg.q_block,
+            k_block=cfg.k_block,
+            device=query.device,
+        )
+        block_scores, block_probs, valid_block_mask = _timed_call(
+            breakdown,
+            "topk_xattn_score",
+            _build_xattn_block_scores_and_probs,
+            query_states,
+            key_states,
+            scaling=float(scaling),
+            cfg=cfg,
+            reduced_valid_mask=reduced_valid_mask,
+            final_valid_block_mask=final_valid_block_mask,
+        )
+    elif cfg.q_pooling == "mean_after":
 
         def _build_mean_after_block_scores() -> tuple[torch.Tensor, torch.Tensor]:
+            assert pooled_key is not None
             pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
             q_abs_offset = k_len - query.shape[0]
             block_score_rows: list[torch.Tensor] = []
@@ -446,6 +517,7 @@ def build_sparse_topk_block_metadata(
             _build_mean_after_block_scores,
         )
     elif cfg.q_pooling == "mean_before":
+        assert pooled_key is not None
         pooled_query = _timed_call(
             breakdown,
             "topk_query_pool",
@@ -490,8 +562,9 @@ def build_sparse_topk_block_metadata(
             torch.full_like(block_scores, float("-inf")),
         ),
     )
-    block_probs = None
-    if cfg.threshold is not None:
+    if not cfg.xattn:
+        block_probs = None
+    if block_probs is None and cfg.threshold is not None:
         block_probs = _timed_call(
             breakdown,
             "topk_softmax",
@@ -535,18 +608,26 @@ def build_sparse_topk_block_metadata(
         if build_retain_tile_block_mask
         else None
     )
-    selection_stats = (
-        _timed_call(
-            breakdown,
-            "topk_selection_stats",
-            _summarize_topk_block_selection,
-            masked_scores=masked_scores,
-            valid_block_mask=valid_block_mask,
-            keep_block_mask=keep_block_mask,
-        )
-        if record_selection_stats
-        else None
-    )
+    selection_stats = None
+    if record_selection_stats:
+        if block_probs is not None:
+            selection_stats = _timed_call(
+                breakdown,
+                "topk_selection_stats",
+                _summarize_sparse_block_selection,
+                block_probs=block_probs,
+                valid_block_mask=valid_block_mask,
+                keep_block_mask=keep_block_mask,
+            )
+        else:
+            selection_stats = _timed_call(
+                breakdown,
+                "topk_selection_stats",
+                _summarize_topk_block_selection,
+                masked_scores=masked_scores,
+                valid_block_mask=valid_block_mask,
+                keep_block_mask=keep_block_mask,
+            )
     return SparseTopKBlockMetadata(
         topk_block_indices=topk_block_indices,
         topk_block_counts=topk_block_counts,
@@ -571,25 +652,43 @@ def build_sparse_topk_block_metadata_from_paged_cache(
     record_selection_stats: bool = False,
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
-    key_cache, _ = _timed_call(
-        breakdown,
-        "paged_extract_kv_for_topk",
-        _extract_unquantized_paged_kv,
-        kv_cache,
-        kv_cache_dtype=kv_cache_dtype,
-    )
-    pooled_key = _timed_call(
-        breakdown,
-        "paged_pool_key",
-        _pool_paged_key_blocks,
-        key_cache=key_cache,
-        block_table_row=block_table_row,
-        seq_len=seq_len,
-        cfg=cfg,
-    )
+    pooled_key = None
+    full_key = None
+    if cfg.xattn:
+        num_kv_heads = int(kv_cache.shape[3])
+        head_dim = int(kv_cache.shape[4])
+        full_key, _ = _timed_call(
+            breakdown,
+            "paged_gather_key",
+            gather_full_sequence_kv_from_paged_cache,
+            kv_cache=kv_cache,
+            block_table_row=block_table_row,
+            seq_len=seq_len,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    else:
+        key_cache, _ = _timed_call(
+            breakdown,
+            "paged_extract_kv_for_topk",
+            _extract_unquantized_paged_kv,
+            kv_cache,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+        pooled_key = _timed_call(
+            breakdown,
+            "paged_pool_key",
+            _pool_paged_key_blocks,
+            key_cache=key_cache,
+            block_table_row=block_table_row,
+            seq_len=seq_len,
+            cfg=cfg,
+        )
     return build_sparse_topk_block_metadata(
         query=query,
         pooled_key=pooled_key,
+        key=full_key,
         scaling=scaling,
         cfg=cfg,
         k_len=seq_len,
@@ -1845,6 +1944,7 @@ def run_triton_sparse_prefill_attention(
     topk_metadata = build_sparse_topk_block_metadata(
         query=query,
         pooled_key=pooled_key,
+        key=key if cfg.xattn else None,
         scaling=scaling,
         cfg=cfg,
         k_len=key.shape[0],
