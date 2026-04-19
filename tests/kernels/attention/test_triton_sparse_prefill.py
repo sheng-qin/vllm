@@ -28,7 +28,7 @@ def _make_cfg(
     k_block: int = 16,
     sink_block: int = 0,
     sliding_window_block: int = 0,
-    q_pooling: str = "mean_before",
+    gqa_shared: str = "none",
     xattn: bool = False,
     xattn_stride: int | None = None,
 ) -> SparsePrefillTopKConfig:
@@ -41,7 +41,7 @@ def _make_cfg(
         threshold=threshold,
         sink_block=sink_block,
         sliding_window_block=sliding_window_block,
-        q_pooling=q_pooling,
+        gqa_shared=gqa_shared,
         xattn=xattn,
         xattn_stride=xattn_stride,
     )
@@ -287,6 +287,164 @@ def test_triton_sparse_prefill_matches_pytorch_cached_prefix_xattn(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_sparse_prefill_matches_pytorch_cached_prefix_xattn_gqa_shared(
+    dtype: torch.dtype,
+):
+    torch.manual_seed(9)
+    seq_len = 161
+    query_len = 33
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    cache_block_size = 16
+    cfg = _make_cfg(
+        topk=None,
+        threshold=0.87,
+        q_block=32,
+        k_block=16,
+        sink_block=1,
+        sliding_window_block=8,
+        gqa_shared="mean",
+        xattn=True,
+        xattn_stride=4,
+    )
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    full_value = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    block_table_row = torch.tensor(
+        [8, 2, 10, 1, 6, 4, 0, 9, 5, 3, 7],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_cache = _build_paged_kv_cache(
+        key=full_key,
+        value=full_value,
+        block_table_row=block_table_row,
+        cache_block_size=cache_block_size,
+    )
+
+    topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        scaling=scale,
+        kv_cache_dtype="auto",
+        cfg=cfg,
+    )
+
+    for group_start in (0, 4):
+        base_indices = topk_metadata.topk_block_indices[group_start]
+        base_counts = topk_metadata.topk_block_counts[group_start]
+        for head_idx in range(group_start + 1, group_start + 4):
+            assert torch.equal(topk_metadata.topk_block_indices[head_idx], base_indices)
+            assert torch.equal(topk_metadata.topk_block_counts[head_idx], base_counts)
+
+    reference = run_sparse_prefill_attention(
+        query=query,
+        key=full_key,
+        value=full_value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+    output = run_triton_sparse_prefill_attention(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        kv_cache_dtype="auto",
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+
+    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_sparse_prefill_matches_pytorch_cached_prefix_gqa_shared_mean_before(
+    dtype: torch.dtype,
+):
+    torch.manual_seed(11)
+    seq_len = 161
+    query_len = 33
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    cache_block_size = 16
+    cfg = _make_cfg(
+        topk=None,
+        threshold=0.87,
+        q_block=32,
+        k_block=16,
+        sink_block=1,
+        sliding_window_block=8,
+        gqa_shared="mean_before",
+    )
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    full_value = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    block_table_row = torch.tensor(
+        [8, 2, 10, 1, 6, 4, 0, 9, 5, 3, 7],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_cache = _build_paged_kv_cache(
+        key=full_key,
+        value=full_value,
+        block_table_row=block_table_row,
+        cache_block_size=cache_block_size,
+    )
+
+    topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        scaling=scale,
+        kv_cache_dtype="auto",
+        cfg=cfg,
+    )
+
+    for group_start in (0, 4):
+        base_indices = topk_metadata.topk_block_indices[group_start]
+        base_counts = topk_metadata.topk_block_counts[group_start]
+        for head_idx in range(group_start + 1, group_start + 4):
+            assert torch.equal(topk_metadata.topk_block_indices[head_idx], base_indices)
+            assert torch.equal(topk_metadata.topk_block_counts[head_idx], base_counts)
+
+    reference = run_sparse_prefill_attention(
+        query=query,
+        key=full_key,
+        value=full_value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+    output = run_triton_sparse_prefill_attention(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        kv_cache_dtype="auto",
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+
+    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("k_block", [1, 4])
 def test_triton_paged_retain_scores_match_pytorch_reference(
     dtype: torch.dtype,
@@ -445,99 +603,6 @@ def test_triton_sparse_prefill_cached_prefix_supports_sink_window_width(
 
     assert topk_metadata.topk_block_indices.shape[2] > cfg.topk
     assert int(topk_metadata.topk_block_counts.max().item()) > cfg.topk
-
-    reference = run_sparse_prefill_attention(
-        query=query,
-        key=full_key,
-        value=full_value,
-        scaling=scale,
-        cfg=cfg,
-        output_dtype=dtype,
-    )
-    output = run_triton_sparse_prefill_attention(
-        query=query,
-        kv_cache=kv_cache,
-        block_table_row=block_table_row,
-        seq_len=seq_len,
-        kv_cache_dtype="auto",
-        scaling=scale,
-        cfg=cfg,
-        output_dtype=dtype,
-    )
-
-    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
-    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
-    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_triton_sparse_prefill_matches_pytorch_full_prefill_mean_after(
-    dtype: torch.dtype,
-):
-    torch.manual_seed(7)
-    q_len = 130
-    num_heads = 8
-    num_kv_heads = 2
-    head_dim = 64
-    cfg = _make_cfg(topk=4, q_block=16, k_block=1, q_pooling="mean_after")
-    scale = 1.0 / math.sqrt(head_dim)
-
-    query = torch.randn(q_len, num_heads, head_dim, device="cuda", dtype=dtype)
-    key = torch.randn(q_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
-    value = torch.randn(q_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
-
-    reference = run_sparse_prefill_attention(
-        query=query,
-        key=key,
-        value=value,
-        scaling=scale,
-        cfg=cfg,
-        output_dtype=dtype,
-    )
-    output = run_triton_sparse_prefill_attention(
-        query=query,
-        key=key,
-        value=value,
-        scaling=scale,
-        cfg=cfg,
-        output_dtype=dtype,
-    )
-
-    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
-    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
-    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_triton_sparse_prefill_matches_pytorch_cached_prefix_mean_after(
-    dtype: torch.dtype,
-):
-    torch.manual_seed(8)
-    seq_len = 97
-    query_len = 33
-    num_heads = 8
-    num_kv_heads = 2
-    head_dim = 64
-    cache_block_size = 16
-    cfg = _make_cfg(topk=4, q_block=16, k_block=1, q_pooling="mean_after")
-    scale = 1.0 / math.sqrt(head_dim)
-
-    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
-    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
-    full_value = torch.randn(
-        seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype
-    )
-    block_table_row = torch.tensor(
-        [3, 0, 5, 1, 6, 4, 2],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    kv_cache = _build_paged_kv_cache(
-        key=full_key,
-        value=full_value,
-        block_table_row=block_table_row,
-        cache_block_size=cache_block_size,
-    )
 
     reference = run_sparse_prefill_attention(
         query=query,

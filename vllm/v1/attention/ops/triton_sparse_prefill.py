@@ -13,14 +13,15 @@ from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import RCP_LN2
 from vllm.v1.attention.backends.sparse_prefill_utils import (
+    _apply_gqa_shared_pooled_query,
     SparsePrefillRetainScoreLogMode,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
+    _apply_gqa_shared_block_scores,
     _build_xattn_block_scores_and_probs,
     _keep_block_mask_to_block_indices,
     _merge_mandatory_and_sparse_blocks,
     _mean_pool_attention_blocks,
-    _pool_query_scores_to_blocks,
     _summarize_sparse_block_selection,
     build_sparse_prefill_selection_stats,
     format_sparse_prefill_selection_policy,
@@ -228,22 +229,6 @@ def _build_causal_valid_block_mask(
     return k_block_start.view(1, 1, 1, k_blocks) <= q_abs_max.view(1, 1, q_blocks, 1)
 
 
-def _build_causal_valid_token_block_mask(
-    *,
-    q_abs_start: int,
-    q_count: int,
-    k_len: int,
-    k_block: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if q_count <= 0 or k_len <= 0:
-        raise ValueError(f"Expected positive q_count/k_len, got {q_count}/{k_len}.")
-    k_blocks = _ceil_div(k_len, k_block)
-    q_abs = torch.arange(q_count, device=device, dtype=torch.long) + int(q_abs_start)
-    k_block_start = torch.arange(k_blocks, device=device, dtype=torch.long) * k_block
-    return k_block_start.view(1, 1, 1, k_blocks) <= q_abs.view(1, 1, q_count, 1)
-
-
 def _pad_topk_indices(
     topk_idx: torch.Tensor,
     counts: torch.Tensor,
@@ -392,8 +377,11 @@ def build_sparse_topk_block_metadata(
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
     key_states = None
+    original_num_kv_heads = None
+    block_probs = None
     if key is not None:
         key_states = key.transpose(0, 1).unsqueeze(0)
+        original_num_kv_heads = int(key_states.shape[1])
         if key_states.shape[1] != query_states.shape[1]:
             if query_states.shape[1] % key_states.shape[1] != 0:
                 raise ValueError(
@@ -421,6 +409,8 @@ def build_sparse_topk_block_metadata(
                 key_states,
                 cfg.k_block,
             )
+        elif original_num_kv_heads is None:
+            original_num_kv_heads = int(pooled_key.shape[1])
         if pooled_key.shape[1] != query_states.shape[1]:
             if query_states.shape[1] % pooled_key.shape[1] != 0:
                 raise ValueError(
@@ -471,59 +461,27 @@ def build_sparse_topk_block_metadata(
             reduced_valid_mask=reduced_valid_mask,
             final_valid_block_mask=final_valid_block_mask,
         )
-    elif cfg.q_pooling == "mean_after":
-
-        def _build_mean_after_block_scores() -> tuple[torch.Tensor, torch.Tensor]:
-            assert pooled_key is not None
-            pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
-            q_abs_offset = k_len - query.shape[0]
-            block_score_rows: list[torch.Tensor] = []
-            valid_block_rows: list[torch.Tensor] = []
-
-            # Stream one q-block at a time so sparse_test_28 does not
-            # materialize the full token-score matrix.
-            for q_start in range(0, query.shape[0], cfg.q_block):
-                q_end = min(q_start + int(cfg.q_block), query.shape[0])
-                query_block = query_states[:, :, q_start:q_end, :].to(torch.float32)
-                token_scores = torch.matmul(query_block, pooled_key_t) * float(scaling)
-                token_valid_mask = _build_causal_valid_token_block_mask(
-                    q_abs_start=q_start + q_abs_offset,
-                    q_count=q_end - q_start,
-                    k_len=k_len,
-                    k_block=cfg.k_block,
-                    device=query.device,
-                )
-                if token_valid_mask.shape[1] != token_scores.shape[1]:
-                    token_valid_mask = token_valid_mask.expand(
-                        token_valid_mask.shape[0],
-                        token_scores.shape[1],
-                        token_valid_mask.shape[2],
-                        token_valid_mask.shape[3],
-                    )
-                block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
-                    token_scores,
-                    token_valid_mask,
-                    q_block=cfg.q_block,
-                    q_pooling=cfg.q_pooling,
-                )
-                block_score_rows.append(block_scores_row)
-                valid_block_rows.append(valid_block_row)
-
-            return torch.cat(block_score_rows, dim=2), torch.cat(valid_block_rows, dim=2)
-
-        block_scores, valid_block_mask = _timed_call(
-            breakdown,
-            "topk_mean_after",
-            _build_mean_after_block_scores,
-        )
-    elif cfg.q_pooling == "mean_before":
+    else:
         assert pooled_key is not None
+        resolved_num_kv_heads = (
+            query_states.shape[1]
+            if original_num_kv_heads is None
+            else int(original_num_kv_heads)
+        )
         pooled_query = _timed_call(
             breakdown,
             "topk_query_pool",
             _mean_pool_attention_blocks,
             query_states,
             cfg.q_block,
+        )
+        pooled_query, _ = _timed_call(
+            breakdown,
+            "topk_gqa_shared_before_score",
+            _apply_gqa_shared_pooled_query,
+            pooled_query,
+            num_kv_heads=resolved_num_kv_heads,
+            cfg=cfg,
         )
         block_scores = _timed_call(
             breakdown,
@@ -550,8 +508,23 @@ def build_sparse_topk_block_metadata(
                 valid_block_mask.shape[2],
                 valid_block_mask.shape[3],
             )
-    else:
-        raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
+
+    resolved_num_kv_heads = (
+        query_states.shape[1]
+        if original_num_kv_heads is None
+        else int(original_num_kv_heads)
+    )
+    block_scores, valid_block_mask, gqa_shared_applied = _timed_call(
+        breakdown,
+        "topk_gqa_shared",
+        _apply_gqa_shared_block_scores,
+        block_scores,
+        valid_block_mask,
+        num_kv_heads=resolved_num_kv_heads,
+        cfg=cfg,
+    )
+    if gqa_shared_applied:
+        block_probs = None
 
     masked_scores = _timed_call(
         breakdown,

@@ -26,8 +26,8 @@ AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV = (
 
 DEFAULT_PV_BLOCK_SIZE = 128
 SparsePrefillRetainScoreLogMode = Literal["off", "summary", "layer", "head"]
-SparsePrefillQPoolingMode = Literal["mean_before", "mean_after"]
 SparsePrefillSelectionMode = Literal["topk", "threshold"]
+SparsePrefillGQASharedMode = Literal["none", "mean", "mean_before"]
 
 logger = init_logger(__name__)
 
@@ -42,7 +42,7 @@ class SparsePrefillTopKConfig:
     threshold: float | None = None
     sink_block: int = 0
     sliding_window_block: int = 0
-    q_pooling: SparsePrefillQPoolingMode = "mean_before"
+    gqa_shared: SparsePrefillGQASharedMode = "none"
     xattn: bool = False
     xattn_stride: int | None = None
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
@@ -80,16 +80,16 @@ class SparsePrefillTopKConfig:
                 "threshold must be in the range (0, 1], "
                 f"got {self.threshold}."
             )
-        if self.q_pooling == "mean_after" and self.k_block != 1:
+        if self.gqa_shared not in {"none", "mean", "mean_before"}:
             raise ValueError(
-                "Sparse scheme field 'q_pooling'='mean_after' currently requires "
-                "'k_block' == 1."
+                "Sparse scheme field 'gqa_shared' must be one of "
+                "'none', 'mean', or 'mean_before'."
             )
         if self.xattn:
-            if self.q_pooling != "mean_before":
+            if self.gqa_shared == "mean_before":
                 raise ValueError(
-                    "Sparse xattn configs currently require "
-                    "'q_pooling'='mean_before'."
+                    "Sparse scheme field 'gqa_shared'='mean_before' currently does "
+                    "not support 'xattn'=true."
                 )
             if self.xattn_stride is None:
                 raise ValueError(
@@ -129,6 +129,8 @@ def format_sparse_prefill_selection_policy(cfg: SparsePrefillTopKConfig) -> str:
         policy = f"threshold={cfg.threshold:g}"
     else:
         policy = f"topk={cfg.topk}"
+    if cfg.gqa_shared != "none":
+        policy = f"{policy},gqa_shared={cfg.gqa_shared}"
     if cfg.xattn:
         policy = f"{policy},xattn_stride={cfg.xattn_stride}"
     return policy
@@ -401,18 +403,18 @@ def _parse_sparse_prefill_xattn_flag(value: object) -> bool:
     return value
 
 
-def _parse_sparse_prefill_q_pooling(value: object) -> SparsePrefillQPoolingMode:
+def _parse_sparse_prefill_gqa_shared(value: object) -> SparsePrefillGQASharedMode:
     if value is None:
-        return "mean_before"
+        return "none"
     if not isinstance(value, str) or not value.strip():
         raise ValueError(
-            "Sparse scheme field 'q_pooling' must be a non-empty string."
+            "Sparse scheme field 'gqa_shared' must be a non-empty string."
         )
     normalized = value.strip().lower()
-    if normalized not in {"mean_before", "mean_after"}:
+    if normalized not in {"none", "mean", "mean_before"}:
         raise ValueError(
-            "Sparse scheme field 'q_pooling' must be one of "
-            "'mean_before' or 'mean_after'."
+            "Sparse scheme field 'gqa_shared' must be one of "
+            "'none', 'mean', or 'mean_before'."
         )
     return normalized  # type: ignore[return-value]
 
@@ -467,7 +469,11 @@ def _load_sparse_prefill_topk_config(
         if threshold_value is not None
         else None
     )
-    q_pooling = _parse_sparse_prefill_q_pooling(scheme.get("q_pooling"))
+    if scheme.get("q_pooling") is not None:
+        raise ValueError(
+            "Sparse scheme field 'q_pooling' is no longer supported."
+        )
+    gqa_shared = _parse_sparse_prefill_gqa_shared(scheme.get("gqa_shared"))
     xattn = _parse_sparse_prefill_xattn_flag(scheme.get("xattn"))
     xattn_stride_value = scheme.get("xattn_stride")
     xattn_stride = (
@@ -491,7 +497,7 @@ def _load_sparse_prefill_topk_config(
             scheme.get("sliding_window_block", 0),
             "sliding_window_block",
         ),
-        q_pooling=q_pooling,
+        gqa_shared=gqa_shared,
         xattn=xattn,
         xattn_stride=xattn_stride,
     )
@@ -705,57 +711,6 @@ def _mean_pool_attention_blocks(x: torch.Tensor, block_size: int) -> torch.Tenso
     return x_blocks.sum(dim=3) / counts.view(1, 1, num_blocks, 1)
 
 
-def _pool_query_scores_to_blocks(
-    token_scores: torch.Tensor,
-    token_valid_mask: torch.Tensor,
-    *,
-    q_block: int,
-    q_pooling: SparsePrefillQPoolingMode,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if q_pooling != "mean_after":
-        raise ValueError(
-            "Score-level q pooling only supports 'mean_after', "
-            f"got {q_pooling!r}."
-        )
-    if q_block <= 0:
-        raise ValueError(f"q_block must be > 0, got {q_block}.")
-    if token_scores.shape != token_valid_mask.shape:
-        raise ValueError(
-            "token_scores and token_valid_mask must have the same shape, got "
-            f"{tuple(token_scores.shape)} vs {tuple(token_valid_mask.shape)}."
-        )
-
-    batch_size, num_heads, q_len, k_blocks = token_scores.shape
-    q_blocks = math.ceil(q_len / q_block)
-    q_pad = q_blocks * q_block - q_len
-    scores_f = token_scores.to(torch.float32)
-    valid = token_valid_mask.to(torch.bool)
-    if q_pad > 0:
-        scores_f = F.pad(scores_f, (0, 0, 0, q_pad))
-        valid = F.pad(valid.to(torch.uint8), (0, 0, 0, q_pad), value=0).to(torch.bool)
-
-    score_blocks = scores_f.contiguous().view(
-        batch_size, num_heads, q_blocks, q_block, k_blocks
-    )
-    valid_blocks = valid.contiguous().view(
-        batch_size, num_heads, q_blocks, q_block, k_blocks
-    )
-    valid_counts = valid_blocks.sum(dim=3)
-    pooled_scores = torch.where(
-        valid_blocks,
-        score_blocks,
-        torch.zeros_like(score_blocks),
-    ).sum(dim=3)
-    pooled_scores = pooled_scores / valid_counts.to(scores_f.dtype).clamp_min(1.0)
-    valid_block_mask = valid_counts > 0
-    pooled_scores = torch.where(
-        valid_block_mask,
-        pooled_scores,
-        torch.zeros_like(pooled_scores),
-    )
-    return pooled_scores, valid_block_mask
-
-
 def _block_validity_from_token_mask(
     allowed_token_mask: torch.Tensor,
     *,
@@ -819,6 +774,102 @@ def _expand_head_mask(mask: torch.Tensor, num_heads: int) -> torch.Tensor:
             f"Expected mask head dimension to be 1 or {num_heads}, got {mask.shape[1]}."
         )
     return mask.expand(mask.shape[0], num_heads, *mask.shape[2:])
+
+
+def _apply_gqa_shared_pooled_query(
+    pooled_query: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    cfg: SparsePrefillTopKConfig,
+) -> tuple[torch.Tensor, bool]:
+    if cfg.gqa_shared != "mean_before":
+        return pooled_query, False
+    if pooled_query.dim() != 4:
+        raise ValueError(
+            "gqa_shared pooled-query reduction expects a 4D tensor, got "
+            f"{tuple(pooled_query.shape)}."
+        )
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be > 0, got {num_kv_heads}.")
+
+    batch_size, num_heads, q_blocks, head_dim = pooled_query.shape
+    if num_heads == num_kv_heads:
+        return pooled_query, False
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            "gqa_shared pooled-query reduction requires query heads to be divisible "
+            f"by KV heads, got num_heads={num_heads} and num_kv_heads={num_kv_heads}."
+        )
+
+    heads_per_group = num_heads // num_kv_heads
+    grouped_query = pooled_query.reshape(
+        batch_size, num_kv_heads, heads_per_group, q_blocks, head_dim
+    )
+    shared_query = grouped_query.mean(dim=2)
+    expanded_query = (
+        shared_query.unsqueeze(2)
+        .expand(-1, -1, heads_per_group, -1, -1)
+        .reshape_as(pooled_query)
+    )
+    return expanded_query, True
+
+
+def _apply_gqa_shared_block_scores(
+    block_scores: torch.Tensor,
+    valid_block_mask: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    cfg: SparsePrefillTopKConfig,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    if cfg.gqa_shared != "mean":
+        return block_scores, valid_block_mask, False
+    if block_scores.dim() != 4 or valid_block_mask.dim() != 4:
+        raise ValueError(
+            "gqa_shared block-score reduction expects 4D tensors, got "
+            f"{tuple(block_scores.shape)} and {tuple(valid_block_mask.shape)}."
+        )
+    if block_scores.shape != valid_block_mask.shape:
+        raise ValueError(
+            "gqa_shared block-score reduction requires score/mask shapes to match, got "
+            f"{tuple(block_scores.shape)} and {tuple(valid_block_mask.shape)}."
+        )
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be > 0, got {num_kv_heads}.")
+
+    batch_size, num_heads, q_blocks, k_blocks = block_scores.shape
+    if num_heads == num_kv_heads:
+        return block_scores, valid_block_mask, False
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            "gqa_shared sparse selection requires query heads to be divisible by "
+            f"KV heads, got num_heads={num_heads} and num_kv_heads={num_kv_heads}."
+        )
+
+    heads_per_group = num_heads // num_kv_heads
+    grouped_scores = block_scores.reshape(
+        batch_size, num_kv_heads, heads_per_group, q_blocks, k_blocks
+    )
+    grouped_valid = valid_block_mask.reshape(
+        batch_size, num_kv_heads, heads_per_group, q_blocks, k_blocks
+    )
+
+    valid_counts = grouped_valid.to(grouped_scores.dtype).sum(dim=2).clamp_min(1.0)
+    shared_scores = torch.where(
+        grouped_valid, grouped_scores, torch.zeros_like(grouped_scores)
+    ).sum(dim=2) / valid_counts
+    shared_valid = grouped_valid.any(dim=2)
+
+    expanded_scores = (
+        shared_scores.unsqueeze(2)
+        .expand(-1, -1, heads_per_group, -1, -1)
+        .reshape_as(block_scores)
+    )
+    expanded_valid = (
+        shared_valid.unsqueeze(2)
+        .expand(-1, -1, heads_per_group, -1, -1)
+        .reshape_as(valid_block_mask)
+    )
+    return expanded_scores, expanded_valid, True
 
 
 def _build_xattn_block_scores_and_probs(
@@ -1186,11 +1237,13 @@ def _build_sparse_attention_mask_topk(
     *,
     scaling: float,
     cfg: SparsePrefillTopKConfig,
+    num_kv_heads: int | None = None,
     return_selection_stats: bool = False,
 ) -> tuple[torch.Tensor, SparsePrefillSelectionStats | None]:
     batch_size, num_heads, q_len, _ = query.shape
     k_len = key.shape[-2]
     mask_dtype = attention_mask.dtype
+    resolved_num_kv_heads = num_heads if num_kv_heads is None else int(num_kv_heads)
 
     base_mask = _broadcast_attention_mask(
         attention_mask,
@@ -1224,49 +1277,29 @@ def _build_sparse_attention_mask_topk(
         )
     else:
         pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
-        if cfg.q_pooling == "mean_after":
-            pooled_key_t = pooled_key.to(torch.float32).transpose(-1, -2)
-            block_score_rows: list[torch.Tensor] = []
-            valid_block_rows: list[torch.Tensor] = []
+        pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
+        pooled_query, _ = _apply_gqa_shared_pooled_query(
+            pooled_query,
+            num_kv_heads=resolved_num_kv_heads,
+            cfg=cfg,
+        )
+        block_scores = (
+            torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
+        )
+        valid_block_mask = _block_validity_from_token_mask(
+            allowed_token_mask,
+            q_block=cfg.q_block,
+            k_block=cfg.k_block,
+        )
 
-            # Stream one q-block at a time to avoid materializing a full
-            # q_len x k_len token-score matrix for exact per-token query scoring.
-            for q_start in range(0, q_len, cfg.q_block):
-                q_end = min(q_start + int(cfg.q_block), q_len)
-                query_block = query[:, :, q_start:q_end, :].to(torch.float32)
-                token_scores = torch.matmul(query_block, pooled_key_t) * float(
-                    scaling
-                )
-                block_token_mask = allowed_token_mask[:, :, q_start:q_end, :]
-                if cfg.k_block != 1:
-                    block_token_mask = _block_validity_from_token_mask(
-                        block_token_mask,
-                        q_block=1,
-                        k_block=cfg.k_block,
-                    )
-                block_scores_row, valid_block_row = _pool_query_scores_to_blocks(
-                    token_scores,
-                    block_token_mask,
-                    q_block=cfg.q_block,
-                    q_pooling=cfg.q_pooling,
-                )
-                block_score_rows.append(block_scores_row)
-                valid_block_rows.append(valid_block_row)
-
-            block_scores = torch.cat(block_score_rows, dim=2)
-            valid_block_mask = torch.cat(valid_block_rows, dim=2)
-        elif cfg.q_pooling == "mean_before":
-            pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
-            block_scores = (
-                torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
-            )
-            valid_block_mask = _block_validity_from_token_mask(
-                allowed_token_mask,
-                q_block=cfg.q_block,
-                k_block=cfg.k_block,
-            )
-        else:
-            raise ValueError(f"Unsupported sparse q_pooling mode: {cfg.q_pooling!r}.")
+    block_scores, valid_block_mask, gqa_shared_applied = _apply_gqa_shared_block_scores(
+        block_scores,
+        valid_block_mask,
+        num_kv_heads=resolved_num_kv_heads,
+        cfg=cfg,
+    )
+    if gqa_shared_applied:
+        block_probs = None
 
     masked_scores = torch.where(
         valid_block_mask,
@@ -1403,6 +1436,7 @@ def run_sparse_prefill_attention(
     - output: [q_len, num_heads, head_dim]
     """
 
+    original_num_kv_heads = int(key.shape[1])
     query_states = query.transpose(0, 1).unsqueeze(0)
     key_states = key.transpose(0, 1).unsqueeze(0)
     value_states = value.transpose(0, 1).unsqueeze(0)
@@ -1434,6 +1468,7 @@ def run_sparse_prefill_attention(
         base_mask,
         scaling=scaling,
         cfg=cfg,
+        num_kv_heads=original_num_kv_heads,
         return_selection_stats=resolved_log_mode != "off",
     )
     if selection_stats is not None:

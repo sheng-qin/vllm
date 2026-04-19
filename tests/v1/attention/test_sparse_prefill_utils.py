@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
+    _build_sparse_attention_mask_topk,
     _select_topk_sparse_blocks,
     _select_threshold_sparse_blocks,
     _reconstruct_sequence_slots,
@@ -42,6 +43,17 @@ from vllm.v1.attention.ops.triton_sparse_prefill import (
     build_sparse_topk_block_metadata,
     build_sparse_topk_block_metadata_from_paged_cache,
 )
+
+
+def _kept_token_positions(sparse_mask: torch.Tensor) -> list[list[int]]:
+    if sparse_mask.shape[2] != 1:
+        raise ValueError(
+            "Test helper expects q_len == 1, got sparse mask shape "
+            f"{tuple(sparse_mask.shape)}."
+        )
+    mask_floor = torch.finfo(sparse_mask.dtype).min / 2
+    visible = sparse_mask[0, :, 0, :] > mask_floor
+    return [row.nonzero(as_tuple=False).reshape(-1).tolist() for row in visible]
 
 
 def test_get_sparse_prefill_topk_config_returns_none_when_disabled(monkeypatch):
@@ -192,7 +204,7 @@ def test_get_sparse_prefill_topk_config_parses_topk_scheme(monkeypatch, tmp_path
     assert cfg.threshold is None
     assert cfg.sink_block == 0
     assert cfg.sliding_window_block == 0
-    assert cfg.q_pooling == "mean_before"
+    assert cfg.gqa_shared == "none"
     assert cfg.max_selected_blocks == 128
     assert format_sparse_prefill_selection_policy(cfg) == "topk=128"
 
@@ -229,19 +241,16 @@ def test_get_sparse_prefill_topk_config_parses_sink_and_sliding_window_blocks(
     assert cfg.threshold is None
     assert cfg.sink_block == 4
     assert cfg.sliding_window_block == 128
-    assert cfg.q_pooling == "mean_before"
     assert cfg.max_selected_blocks == 2180
 
 
-def test_get_sparse_prefill_topk_config_parses_mean_after_q_pooling(
-    monkeypatch, tmp_path
-):
+def test_get_sparse_prefill_topk_config_rejects_q_pooling_field(monkeypatch, tmp_path):
     sparse_json = tmp_path / "sparse.json"
     sparse_json.write_text(
         json.dumps(
             {
-                "sparse_test_28": {
-                    "name": "q_256_after_k_1_topk_2048",
+                "sparse_bad": {
+                    "name": "bad_sparse",
                     "q_block": 256,
                     "k_block": 1,
                     "topk": 2048,
@@ -253,12 +262,10 @@ def test_get_sparse_prefill_topk_config_parses_mean_after_q_pooling(
 
     monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
-    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_28")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
 
-    cfg = get_sparse_prefill_topk_config()
-    assert cfg is not None
-    assert cfg.q_pooling == "mean_after"
-    assert cfg.k_block == 1
+    with pytest.raises(ValueError, match="field 'q_pooling' is no longer supported"):
+        get_sparse_prefill_topk_config()
 
 
 def test_get_sparse_prefill_topk_config_parses_xattn_scheme(monkeypatch, tmp_path):
@@ -287,6 +294,64 @@ def test_get_sparse_prefill_topk_config_parses_xattn_scheme(monkeypatch, tmp_pat
     assert cfg.xattn is True
     assert cfg.xattn_stride == 8
     assert format_sparse_prefill_selection_policy(cfg) == "topk=128,xattn_stride=8"
+
+
+def test_get_sparse_prefill_topk_config_parses_gqa_shared_mean(monkeypatch, tmp_path):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_57": {
+                    "name": "q_32_gqa_shared_k_16_threshold_0.87",
+                    "q_block": 32,
+                    "k_block": 16,
+                    "threshold": 0.87,
+                    "gqa_shared": "mean",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_57")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.gqa_shared == "mean"
+    assert format_sparse_prefill_selection_policy(cfg) == (
+        "threshold=0.87,gqa_shared=mean"
+    )
+
+
+def test_get_sparse_prefill_topk_config_parses_gqa_shared_mean_before(
+    monkeypatch, tmp_path
+):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_63": {
+                    "name": "q_32_gqa_shared_k_16_threshold_0.87_sink1_swa8",
+                    "q_block": 32,
+                    "k_block": 16,
+                    "threshold": 0.87,
+                    "gqa_shared": "mean_before",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_63")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.gqa_shared == "mean_before"
+    assert format_sparse_prefill_selection_policy(cfg) == (
+        "threshold=0.87,gqa_shared=mean_before"
+    )
 
 
 def test_get_sparse_prefill_topk_config_parses_threshold_scheme(
@@ -344,7 +409,7 @@ def test_get_sparse_prefill_topk_config_rejects_negative_sink_or_window_blocks(
         get_sparse_prefill_topk_config()
 
 
-def test_get_sparse_prefill_topk_config_rejects_invalid_q_pooling(monkeypatch, tmp_path):
+def test_get_sparse_prefill_topk_config_rejects_invalid_gqa_shared(monkeypatch, tmp_path):
     sparse_json = tmp_path / "sparse.json"
     sparse_json.write_text(
         json.dumps(
@@ -354,7 +419,7 @@ def test_get_sparse_prefill_topk_config_rejects_invalid_q_pooling(monkeypatch, t
                     "q_block": 16,
                     "k_block": 1,
                     "topk": 32,
-                    "q_pooling": "median_after",
+                    "gqa_shared": "sum",
                 }
             }
         )
@@ -364,33 +429,7 @@ def test_get_sparse_prefill_topk_config_rejects_invalid_q_pooling(monkeypatch, t
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
     monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
 
-    with pytest.raises(ValueError, match="field 'q_pooling' must be one of"):
-        get_sparse_prefill_topk_config()
-
-
-def test_get_sparse_prefill_topk_config_rejects_mean_after_without_k1(
-    monkeypatch, tmp_path
-):
-    sparse_json = tmp_path / "sparse.json"
-    sparse_json.write_text(
-        json.dumps(
-            {
-                "sparse_bad": {
-                    "name": "bad_sparse",
-                    "q_block": 16,
-                    "k_block": 4,
-                    "topk": 32,
-                    "q_pooling": "mean_after",
-                }
-            }
-        )
-    )
-
-    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
-    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
-    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
-
-    with pytest.raises(ValueError, match="requires 'k_block' == 1"):
+    with pytest.raises(ValueError, match="field 'gqa_shared' must be one of"):
         get_sparse_prefill_topk_config()
 
 
@@ -420,15 +459,15 @@ def test_get_sparse_prefill_topk_config_rejects_xattn_stride_without_xattn(
         get_sparse_prefill_topk_config()
 
 
-def test_sparse_prefill_topk_config_rejects_xattn_mean_after():
-    with pytest.raises(ValueError, match="xattn configs currently require"):
+def test_sparse_prefill_topk_config_rejects_gqa_shared_mean_before_xattn():
+    with pytest.raises(ValueError, match="gqa_shared'='mean_before'.*xattn'=true"):
         SparsePrefillTopKConfig(
             key="test_sparse",
             name="test_sparse",
             q_block=64,
-            k_block=1,
+            k_block=16,
             topk=128,
-            q_pooling="mean_after",
+            gqa_shared="mean_before",
             xattn=True,
             xattn_stride=8,
         )
@@ -652,56 +691,170 @@ def test_build_sparse_topk_block_metadata_threshold_accounts_for_mandatory_block
     assert metadata.selection_stats.total_kept_blocks == 3
 
 
-def test_build_sparse_topk_block_metadata_mean_after_changes_first_block_selection():
+def test_build_sparse_attention_mask_topk_gqa_shared_mean_shares_topk_selection():
     query = torch.tensor(
-        [
-            [[2.0, 0.0]],
-            [[0.0, 4.0]],
-            [[1.0, 0.0]],
-            [[1.0, 0.0]],
-        ],
+        [[[[2.0, 0.0]], [[0.0, 2.0]]]],
         dtype=torch.float32,
     )
-    pooled_key = torch.tensor(
-        [[[[3.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]]],
+    base_key = torch.tensor(
+        [[[[1.1, 0.0], [0.0, 1.0], [0.75, 0.75]]]],
         dtype=torch.float32,
     )
-    mean_before_cfg = SparsePrefillTopKConfig(
+    key = base_key.expand(1, 2, -1, -1).clone()
+    attention_mask = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+    no_share_cfg = SparsePrefillTopKConfig(
         key="test_sparse",
         name="test_sparse",
-        q_block=2,
+        q_block=1,
         k_block=1,
         topk=1,
-        q_pooling="mean_before",
     )
-    mean_after_cfg = SparsePrefillTopKConfig(
+    shared_cfg = SparsePrefillTopKConfig(
         key="test_sparse",
         name="test_sparse",
-        q_block=2,
+        q_block=1,
         k_block=1,
         topk=1,
-        q_pooling="mean_after",
+        gqa_shared="mean",
     )
 
-    before = build_sparse_topk_block_metadata(
-        query=query,
-        pooled_key=pooled_key,
+    no_share_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
         scaling=1.0,
-        cfg=mean_before_cfg,
-        k_len=4,
+        cfg=no_share_cfg,
+        num_kv_heads=1,
     )
-    after = build_sparse_topk_block_metadata(
-        query=query,
-        pooled_key=pooled_key,
+    shared_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
         scaling=1.0,
-        cfg=mean_after_cfg,
-        k_len=4,
+        cfg=shared_cfg,
+        num_kv_heads=1,
     )
 
-    assert before.topk_block_counts.tolist() == [[1, 1]]
-    assert after.topk_block_counts.tolist() == [[1, 1]]
-    assert before.topk_block_indices[0, 0, 0].item() == 0
-    assert after.topk_block_indices[0, 0, 0].item() == 1
+    assert _kept_token_positions(no_share_mask) == [[0], [1]]
+    assert _kept_token_positions(shared_mask) == [[2], [2]]
+
+
+def test_build_sparse_attention_mask_topk_gqa_shared_mean_shares_threshold_selection():
+    query = torch.tensor(
+        [[[[2.0, 0.0]], [[0.0, 2.0]]]],
+        dtype=torch.float32,
+    )
+    base_key = torch.tensor(
+        [[[[1.1, 0.0], [0.0, 1.0], [0.75, 0.75]]]],
+        dtype=torch.float32,
+    )
+    key = base_key.expand(1, 2, -1, -1).clone()
+    attention_mask = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+    no_share_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=1,
+        threshold=0.55,
+    )
+    shared_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=1,
+        threshold=0.55,
+        gqa_shared="mean",
+    )
+
+    no_share_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=no_share_cfg,
+        num_kv_heads=1,
+    )
+    shared_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=shared_cfg,
+        num_kv_heads=1,
+    )
+
+    assert _kept_token_positions(no_share_mask) == [[0], [1]]
+    assert _kept_token_positions(shared_mask) == [[0, 2], [0, 2]]
+
+
+def test_build_sparse_attention_mask_topk_gqa_shared_mean_before_shares_before_score():
+    query = torch.tensor(
+        [[[[2.1, 0.0]], [[0.0, 2.0]]]],
+        dtype=torch.float32,
+    )
+    base_key = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 1.0], [0.8, 0.8]]]],
+        dtype=torch.float32,
+    )
+    key = base_key.expand(1, 2, -1, -1).clone()
+    attention_mask = torch.full((1, 2, 1, 3), torch.finfo(torch.float32).min)
+    attention_mask[0, 0, 0, [0, 2]] = 0.0
+    attention_mask[0, 1, 0, [1, 2]] = 0.0
+
+    no_share_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=1,
+        topk=1,
+    )
+    shared_after_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=1,
+        topk=1,
+        gqa_shared="mean",
+    )
+    shared_before_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=1,
+        topk=1,
+        gqa_shared="mean_before",
+    )
+
+    no_share_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=no_share_cfg,
+        num_kv_heads=1,
+    )
+    shared_after_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=shared_after_cfg,
+        num_kv_heads=1,
+    )
+    shared_before_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=shared_before_cfg,
+        num_kv_heads=1,
+    )
+
+    assert _kept_token_positions(no_share_mask) == [[0], [1]]
+    assert _kept_token_positions(shared_after_mask) == [[0], []]
+    assert _kept_token_positions(shared_before_mask) == [[2], [2]]
 
 
 def test_build_sparse_topk_block_metadata_supports_xattn_asymmetric_blocks():
