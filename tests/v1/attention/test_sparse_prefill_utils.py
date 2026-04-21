@@ -18,9 +18,11 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     AUTOPTQ_SPARSE_RUNTIME_KEY_ENV,
     AUTOPTQ_VLLM_SPARSE_ENABLE_ENV,
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
+    AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV,
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
+    _build_sparse_selection_component_keep_masks,
     _build_sparse_attention_mask_topk,
     _select_topk_sparse_blocks,
     _select_threshold_sparse_blocks,
@@ -30,6 +32,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     get_sparse_prefill_impl_mode,
     get_sparse_prefill_retain_score_log_mode,
     get_sparse_prefill_topk_config,
+    is_sparse_prefill_component_retain_score_recording_enabled,
     is_sparse_prefill_retain_score_recording_enabled,
     is_cached_prefix_prefill_request,
     is_full_prefill_request,
@@ -128,6 +131,49 @@ def test_sparse_prefill_retain_score_switch_rejects_invalid_mode(monkeypatch):
 
     with pytest.raises(ValueError, match="must be one of"):
         get_sparse_prefill_retain_score_log_mode()
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected_enabled"),
+    [
+        ("1", True),
+        ("true", True),
+        ("On", True),
+        ("0", False),
+        ("false", False),
+        ("", False),
+    ],
+)
+def test_sparse_prefill_component_retain_score_switch_parses_modes(
+    monkeypatch, env_value: str, expected_enabled: bool
+):
+    monkeypatch.setenv(
+        AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV, env_value
+    )
+
+    assert (
+        is_sparse_prefill_component_retain_score_recording_enabled()
+        is expected_enabled
+    )
+
+
+def test_sparse_prefill_component_retain_score_switch_defaults_to_off(monkeypatch):
+    monkeypatch.delenv(
+        AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV, raising=False
+    )
+
+    assert not is_sparse_prefill_component_retain_score_recording_enabled()
+
+
+def test_sparse_prefill_component_retain_score_switch_rejects_invalid_mode(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV, "components"
+    )
+
+    with pytest.raises(ValueError, match="must be one of"):
+        is_sparse_prefill_component_retain_score_recording_enabled()
 
 
 def test_sparse_force_paged_full_prefill_defaults_to_enabled(monkeypatch):
@@ -242,6 +288,9 @@ def test_get_sparse_prefill_topk_config_parses_sink_and_sliding_window_blocks(
     assert cfg.sink_block == 4
     assert cfg.sliding_window_block == 128
     assert cfg.max_selected_blocks == 2180
+    assert format_sparse_prefill_selection_policy(cfg) == (
+        "topk=2048,sink_block=4,sliding_window_block=128"
+    )
 
 
 def test_get_sparse_prefill_topk_config_rejects_q_pooling_field(monkeypatch, tmp_path):
@@ -294,6 +343,33 @@ def test_get_sparse_prefill_topk_config_parses_xattn_scheme(monkeypatch, tmp_pat
     assert cfg.xattn is True
     assert cfg.xattn_stride == 8
     assert format_sparse_prefill_selection_policy(cfg) == "topk=128,xattn_stride=8"
+
+
+def test_get_sparse_prefill_topk_config_parses_k_sum_scheme(monkeypatch, tmp_path):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_test_41_2": {
+                    "name": "q_16_k_16_topk_128_k_sum",
+                    "q_block": 16,
+                    "k_block": 16,
+                    "topk": 128,
+                    "k_sum": True,
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_test_41_2")
+
+    cfg = get_sparse_prefill_topk_config()
+    assert cfg is not None
+    assert cfg.k_sum is True
+    assert cfg.xattn is False
+    assert format_sparse_prefill_selection_policy(cfg) == "topk=128,k_sum=true"
 
 
 def test_get_sparse_prefill_topk_config_parses_gqa_shared_mean(monkeypatch, tmp_path):
@@ -459,6 +535,30 @@ def test_get_sparse_prefill_topk_config_rejects_xattn_stride_without_xattn(
         get_sparse_prefill_topk_config()
 
 
+def test_get_sparse_prefill_topk_config_rejects_nonbool_k_sum(monkeypatch, tmp_path):
+    sparse_json = tmp_path / "sparse.json"
+    sparse_json.write_text(
+        json.dumps(
+            {
+                "sparse_bad": {
+                    "name": "bad_sparse",
+                    "q_block": 16,
+                    "k_block": 16,
+                    "topk": 32,
+                    "k_sum": "yes",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv(AUTOPTQ_VLLM_SPARSE_ENABLE_ENV, "1")
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_JSON_ENV, str(sparse_json))
+    monkeypatch.setenv(AUTOPTQ_SPARSE_RUNTIME_KEY_ENV, "sparse_bad")
+
+    with pytest.raises(ValueError, match="field 'k_sum' must be a boolean"):
+        get_sparse_prefill_topk_config()
+
+
 def test_sparse_prefill_topk_config_rejects_gqa_shared_mean_before_xattn():
     with pytest.raises(ValueError, match="gqa_shared'='mean_before'.*xattn'=true"):
         SparsePrefillTopKConfig(
@@ -469,6 +569,20 @@ def test_sparse_prefill_topk_config_rejects_gqa_shared_mean_before_xattn():
             topk=128,
             gqa_shared="mean_before",
             xattn=True,
+            xattn_stride=8,
+        )
+
+
+def test_sparse_prefill_topk_config_rejects_k_sum_with_xattn():
+    with pytest.raises(ValueError, match="k_sum'=true.*xattn'=true"):
+        SparsePrefillTopKConfig(
+            key="test_sparse",
+            name="test_sparse",
+            q_block=64,
+            k_block=16,
+            topk=128,
+            xattn=True,
+            k_sum=True,
             xattn_stride=8,
         )
 
@@ -602,6 +716,153 @@ def test_build_sparse_topk_block_metadata_merges_sink_window_and_remainder_topk(
     assert metadata.topk_block_indices[0, 1].tolist() == [0, 4, 5]
     assert metadata.selection_stats is not None
     assert metadata.selection_stats.total_kept_blocks == 6
+    assert metadata.component_selection_stats is not None
+    assert metadata.component_selection_stats["sink_block"].total_kept_blocks == 2
+    assert (
+        metadata.component_selection_stats["sliding_window_block"].total_kept_blocks
+        == 2
+    )
+    assert (
+        metadata.component_selection_stats["sliding_window_block_0"].total_kept_blocks
+        == 2
+    )
+    assert metadata.component_selection_stats["mandatory_union"].total_kept_blocks == 4
+
+
+def test_build_sparse_selection_component_keep_masks_splits_sliding_window_blocks():
+    valid_block_mask = torch.tensor(
+        [
+            [
+                [
+                    [True, True, True, True, False, False],
+                    [True, True, True, True, True, True],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+
+    component_keep_masks = _build_sparse_selection_component_keep_masks(
+        valid_block_mask,
+        sink_block=1,
+        sliding_window_block=2,
+    )
+
+    assert list(component_keep_masks) == [
+        "sink_block",
+        "sliding_window_block",
+        "sliding_window_block_0",
+        "sliding_window_block_1",
+        "mandatory_union",
+    ]
+    assert component_keep_masks["sliding_window_block"].tolist() == [
+        [
+            [
+                [False, False, True, True, False, False],
+                [False, False, False, False, True, True],
+            ]
+        ]
+    ]
+    assert component_keep_masks["sliding_window_block_0"].tolist() == [
+        [
+            [
+                [False, False, False, True, False, False],
+                [False, False, False, False, False, True],
+            ]
+        ]
+    ]
+    assert component_keep_masks["sliding_window_block_1"].tolist() == [
+        [
+            [
+                [False, False, True, False, False, False],
+                [False, False, False, False, True, False],
+            ]
+        ]
+    ]
+    assert component_keep_masks["mandatory_union"].tolist() == [
+        [
+            [
+                [True, False, True, True, False, False],
+                [True, False, False, False, True, True],
+            ]
+        ]
+    ]
+
+
+def test_build_sparse_topk_block_metadata_records_per_sliding_window_component_masks():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        sink_block=1,
+        sliding_window_block=2,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor(
+        [[[[0.0], [1.0], [10.0], [20.0], [30.0], [40.0]]]],
+        dtype=torch.float32,
+    )
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=6,
+        build_retain_tile_block_mask=True,
+        record_selection_stats=True,
+    )
+
+    assert metadata.component_selection_stats is not None
+    assert (
+        metadata.component_selection_stats["sliding_window_block"].total_kept_blocks
+        == 4
+    )
+    assert (
+        metadata.component_selection_stats["sliding_window_block_0"].total_kept_blocks
+        == 2
+    )
+    assert (
+        metadata.component_selection_stats["sliding_window_block_1"].total_kept_blocks
+        == 2
+    )
+    assert metadata.component_retain_tile_block_masks is not None
+    assert "sliding_window_block_0" in metadata.component_retain_tile_block_masks
+    assert "sliding_window_block_1" in metadata.component_retain_tile_block_masks
+
+
+def test_build_sparse_topk_block_metadata_can_disable_component_stats():
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=2,
+        k_block=1,
+        topk=1,
+        sink_block=1,
+        sliding_window_block=2,
+    )
+    query = torch.ones((4, 1, 1), dtype=torch.float32)
+    pooled_key = torch.tensor(
+        [[[[0.0], [1.0], [10.0], [20.0], [30.0], [40.0]]]],
+        dtype=torch.float32,
+    )
+
+    metadata = build_sparse_topk_block_metadata(
+        query=query,
+        pooled_key=pooled_key,
+        scaling=1.0,
+        cfg=cfg,
+        k_len=6,
+        build_retain_tile_block_mask=True,
+        record_selection_stats=True,
+        record_component_selection_stats=False,
+    )
+
+    assert metadata.selection_stats is not None
+    assert metadata.component_selection_stats is None
+    assert metadata.component_retain_tile_block_masks is None
 
 
 def test_build_sparse_topk_block_metadata_dedupes_sink_window_overlap():
@@ -738,6 +999,90 @@ def test_build_sparse_attention_mask_topk_gqa_shared_mean_shares_topk_selection(
 
     assert _kept_token_positions(no_share_mask) == [[0], [1]]
     assert _kept_token_positions(shared_mask) == [[2], [2]]
+
+
+def test_build_sparse_attention_mask_topk_k_sum_changes_topk_block_selection():
+    query = torch.tensor([[[[1.0]]]], dtype=torch.float32)
+    key = torch.tensor([[[[2.0], [-2.0], [1.0]]]], dtype=torch.float32)
+    attention_mask = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+    mean_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=2,
+        topk=1,
+    )
+    k_sum_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=2,
+        topk=1,
+        k_sum=True,
+    )
+
+    mean_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=mean_cfg,
+        num_kv_heads=1,
+    )
+    k_sum_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=k_sum_cfg,
+        num_kv_heads=1,
+    )
+
+    assert _kept_token_positions(mean_mask) == [[2]]
+    assert _kept_token_positions(k_sum_mask) == [[0, 1]]
+
+
+def test_build_sparse_attention_mask_topk_k_sum_changes_threshold_selection():
+    query = torch.tensor([[[[1.0]]]], dtype=torch.float32)
+    key = torch.tensor([[[[2.0], [-2.0], [1.0]]]], dtype=torch.float32)
+    attention_mask = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+    mean_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=2,
+        threshold=0.5,
+    )
+    k_sum_cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=1,
+        k_block=2,
+        threshold=0.5,
+        k_sum=True,
+    )
+
+    mean_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=mean_cfg,
+        num_kv_heads=1,
+    )
+    k_sum_mask, _ = _build_sparse_attention_mask_topk(
+        query,
+        key,
+        attention_mask,
+        scaling=1.0,
+        cfg=k_sum_cfg,
+        num_kv_heads=1,
+    )
+
+    assert _kept_token_positions(mean_mask) == [[2]]
+    assert _kept_token_positions(k_sum_mask) == [[0, 1]]
 
 
 def test_build_sparse_attention_mask_topk_gqa_shared_mean_shares_threshold_selection():
@@ -1107,6 +1452,47 @@ def test_log_triton_retain_score_stats_logs_approx_and_exact(monkeypatch):
     assert "threshold=0.9" in logged[0]
     assert "approx_retain_mass=0.900000" in logged[0]
     assert "avg_retain_score=0.980000" in logged[0]
+
+
+def test_log_triton_retain_score_stats_includes_component_name(monkeypatch):
+    cfg = SparsePrefillTopKConfig(
+        key="test_sparse",
+        name="test_sparse",
+        q_block=16,
+        k_block=16,
+        topk=4,
+        sink_block=1,
+        sliding_window_block=2,
+    )
+    stats = SparsePrefillSelectionStats(
+        total_valid_blocks=32,
+        total_kept_blocks=4,
+        total_valid_rows=8,
+        retained_attention_score_sum=7.2,
+    )
+
+    logged: list[str] = []
+
+    def _capture_info(message: str, *args):
+        logged.append(message % args)
+
+    monkeypatch.setattr(triton_sparse_prefill_module.logger, "info", _capture_info)
+
+    _log_triton_retain_score_stats(
+        layer=None,
+        query_len=32,
+        seq_len=64,
+        cfg=cfg,
+        paged_kv=True,
+        selection_stats=stats,
+        approx_selection_stats=stats,
+        component_name="sink_block",
+        retain_score_log_mode="summary",
+    )
+
+    assert len(logged) == 1
+    assert "component=sink_block" in logged[0]
+    assert "topk=4,sink_block=1,sliding_window_block=2" in logged[0]
 
 
 def test_sparse_output_nan_check_accepts_finite_output():

@@ -17,11 +17,13 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.sparse_prefill_utils import (
+    AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV,
     AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
     AUTOPTQ_VLLM_SPARSE_IMPL_ENV,
     SparsePrefillTopKConfig,
     format_sparse_prefill_selection_policy,
     gather_full_sequence_kv_from_paged_cache,
+    is_sparse_prefill_component_retain_score_recording_enabled,
     get_sparse_prefill_topk_config,
     get_sparse_prefill_impl_mode,
     get_sparse_prefill_retain_score_log_mode,
@@ -224,6 +226,10 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
         self.sparse_impl_mode = get_sparse_prefill_impl_mode()
         self.retain_score_log_mode = get_sparse_prefill_retain_score_log_mode()
         self.record_retain_score = self.retain_score_log_mode != "off"
+        self.record_component_retain_score = (
+            self.record_retain_score
+            and is_sparse_prefill_component_retain_score_recording_enabled()
+        )
         self.force_paged_full_prefill = _parse_optional_env_flag(
             AUTOPTQ_VLLM_SPARSE_FORCE_PAGED_FULL_PREFILL_ENV,
             default=True,
@@ -249,6 +255,13 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                 AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV,
                 scope="local",
             )
+            if not self.record_component_retain_score:
+                logger.info_once(
+                    "Sparse prefill FlashAttention will suppress component "
+                    "retain-score breakdown because %s is disabled or unset.",
+                    AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV,
+                    scope="local",
+                )
         if self.force_paged_full_prefill:
             logger.info_once(
                 "Sparse prefill FlashAttention will route full-prefill sparse "
@@ -491,6 +504,9 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             record_retain_score=self.record_retain_score,
                             retain_score_log_mode=self.retain_score_log_mode,
                             layer=layer,
+                            record_component_retain_score=(
+                                self.record_component_retain_score
+                            ),
                         )
                     elif is_full_prefill_request(query_len, seq_len):
                         sparse_output = run_triton_sparse_prefill_attention(
@@ -503,6 +519,9 @@ class SparsePrefillFlashAttentionImpl(FlashAttentionImpl):
                             record_retain_score=self.record_retain_score,
                             retain_score_log_mode=self.retain_score_log_mode,
                             layer=layer,
+                            record_component_retain_score=(
+                                self.record_component_retain_score
+                            ),
                         )
                     if sparse_output is not None:
                         _ensure_sparse_output_has_no_nan(

@@ -23,6 +23,9 @@ AUTOPTQ_VLLM_SPARSE_IMPL_ENV = "AUTOPTQ_VLLM_SPARSE_IMPL"
 AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE_ENV = (
     "AUTOPTQ_VLLM_SPARSE_RECORD_RETAIN_SCORE"
 )
+AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV = (
+    "AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE"
+)
 
 DEFAULT_PV_BLOCK_SIZE = 128
 SparsePrefillRetainScoreLogMode = Literal["off", "summary", "layer", "head"]
@@ -44,6 +47,7 @@ class SparsePrefillTopKConfig:
     sliding_window_block: int = 0
     gqa_shared: SparsePrefillGQASharedMode = "none"
     xattn: bool = False
+    k_sum: bool = False
     xattn_stride: int | None = None
     pv_block_size: int = DEFAULT_PV_BLOCK_SIZE
 
@@ -84,6 +88,11 @@ class SparsePrefillTopKConfig:
             raise ValueError(
                 "Sparse scheme field 'gqa_shared' must be one of "
                 "'none', 'mean', or 'mean_before'."
+            )
+        if self.xattn and self.k_sum:
+            raise ValueError(
+                "Sparse scheme field 'k_sum'=true currently does not support "
+                "'xattn'=true."
             )
         if self.xattn:
             if self.gqa_shared == "mean_before":
@@ -129,8 +138,14 @@ def format_sparse_prefill_selection_policy(cfg: SparsePrefillTopKConfig) -> str:
         policy = f"threshold={cfg.threshold:g}"
     else:
         policy = f"topk={cfg.topk}"
+    if cfg.sink_block > 0:
+        policy = f"{policy},sink_block={cfg.sink_block}"
+    if cfg.sliding_window_block > 0:
+        policy = f"{policy},sliding_window_block={cfg.sliding_window_block}"
     if cfg.gqa_shared != "none":
         policy = f"{policy},gqa_shared={cfg.gqa_shared}"
+    if cfg.k_sum:
+        policy = f"{policy},k_sum=true"
     if cfg.xattn:
         policy = f"{policy},xattn_stride={cfg.xattn_stride}"
     return policy
@@ -309,6 +324,21 @@ def _parse_sparse_prefill_retain_score_log_mode(
     return mode_map[normalized]
 
 
+def _parse_optional_env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of '0', '1', 'true', 'false', 'on', or 'off'."
+    )
+
+
 def _parse_env_flag(value: str | None) -> bool:
     if value is None:
         return False
@@ -327,6 +357,13 @@ def get_sparse_prefill_retain_score_log_mode() -> SparsePrefillRetainScoreLogMod
 
 def is_sparse_prefill_retain_score_recording_enabled() -> bool:
     return get_sparse_prefill_retain_score_log_mode() != "off"
+
+
+def is_sparse_prefill_component_retain_score_recording_enabled() -> bool:
+    return _parse_optional_env_flag(
+        AUTOPTQ_VLLM_SPARSE_RECORD_COMPONENT_RETAIN_SCORE_ENV,
+        default=False,
+    )
 
 
 def resolve_sparse_prefill_retain_score_log_mode(
@@ -403,6 +440,14 @@ def _parse_sparse_prefill_xattn_flag(value: object) -> bool:
     return value
 
 
+def _parse_sparse_prefill_k_sum_flag(value: object) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("Sparse scheme field 'k_sum' must be a boolean.")
+    return value
+
+
 def _parse_sparse_prefill_gqa_shared(value: object) -> SparsePrefillGQASharedMode:
     if value is None:
         return "none"
@@ -475,6 +520,7 @@ def _load_sparse_prefill_topk_config(
         )
     gqa_shared = _parse_sparse_prefill_gqa_shared(scheme.get("gqa_shared"))
     xattn = _parse_sparse_prefill_xattn_flag(scheme.get("xattn"))
+    k_sum = _parse_sparse_prefill_k_sum_flag(scheme.get("k_sum"))
     xattn_stride_value = scheme.get("xattn_stride")
     xattn_stride = (
         _require_positive_int(xattn_stride_value, "xattn_stride")
@@ -499,6 +545,7 @@ def _load_sparse_prefill_topk_config(
         ),
         gqa_shared=gqa_shared,
         xattn=xattn,
+        k_sum=k_sum,
         xattn_stride=xattn_stride,
     )
 
@@ -709,6 +756,71 @@ def _mean_pool_attention_blocks(x: torch.Tensor, block_size: int) -> torch.Tenso
     if pad > 0:
         counts[-1] = block_size - pad
     return x_blocks.sum(dim=3) / counts.view(1, 1, num_blocks, 1)
+
+
+def _build_k_sum_block_probs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    scaling: float,
+    token_valid_mask: torch.Tensor,
+    k_block: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_block <= 0:
+        raise ValueError(f"k_block must be > 0, got {k_block}.")
+    if query.dim() != 4 or key.dim() != 4 or token_valid_mask.dim() != 4:
+        raise ValueError(
+            "k_sum block-prob construction expects 4D query/key/mask tensors, got "
+            f"{tuple(query.shape)}, {tuple(key.shape)}, and {tuple(token_valid_mask.shape)}."
+        )
+    if query.shape[:2] != key.shape[:2] or query.shape[-1] != key.shape[-1]:
+        raise ValueError(
+            "k_sum block-prob construction requires matching batch/head/head_dim "
+            f"for query/key, got {tuple(query.shape)} and {tuple(key.shape)}."
+        )
+    if token_valid_mask.shape != (*query.shape[:3], key.shape[-2]):
+        raise ValueError(
+            "k_sum block-prob construction requires token_valid_mask to match "
+            f"query/key score shape, got {tuple(token_valid_mask.shape)} vs "
+            f"{(*query.shape[:3], key.shape[-2])}."
+        )
+
+    score_values = (
+        torch.matmul(query.to(torch.float32), key.to(torch.float32).transpose(-1, -2))
+        * float(scaling)
+    )
+    masked_scores = torch.where(
+        token_valid_mask,
+        score_values,
+        torch.full_like(score_values, -1e30),
+    )
+    row_has_valid = token_valid_mask.any(dim=-1, keepdim=True)
+    token_probs = torch.softmax(masked_scores, dim=-1)
+    token_probs = torch.where(row_has_valid, token_probs, torch.zeros_like(token_probs))
+
+    valid_block_mask = _block_validity_from_token_mask(
+        token_valid_mask,
+        q_block=1,
+        k_block=k_block,
+    )
+    k_len = token_probs.shape[-1]
+    k_blocks = math.ceil(k_len / k_block)
+    k_pad = k_blocks * k_block - k_len
+    if k_pad > 0:
+        token_probs = F.pad(token_probs, (0, k_pad), value=0.0)
+    block_probs = token_probs.contiguous().view(
+        token_probs.shape[0],
+        token_probs.shape[1],
+        token_probs.shape[2],
+        k_blocks,
+        k_block,
+    ).sum(dim=-1)
+    block_probs = torch.where(
+        valid_block_mask,
+        block_probs,
+        torch.zeros_like(block_probs),
+    )
+    return block_probs, valid_block_mask
 
 
 def _block_validity_from_token_mask(
@@ -1028,6 +1140,68 @@ def _build_mandatory_sparse_block_mask(
     return keep_mask
 
 
+def _build_sliding_window_component_keep_mask(
+    valid_block_mask: torch.Tensor,
+    *,
+    sliding_window_block: int,
+    window_block_index: int,
+) -> torch.Tensor:
+    if sliding_window_block <= 0:
+        return torch.zeros_like(valid_block_mask)
+    if window_block_index < 0 or window_block_index >= sliding_window_block:
+        raise ValueError(
+            "window_block_index must be in [0, sliding_window_block), got "
+            f"{window_block_index} for sliding_window_block={sliding_window_block}."
+        )
+
+    valid_int = valid_block_mask.to(torch.int32)
+    valid_rank = torch.cumsum(valid_int, dim=-1) - 1
+    valid_count = valid_int.sum(dim=-1, keepdim=True)
+    target_rank = (valid_count - 1 - int(window_block_index)).clamp_min(0)
+    has_target_rank = valid_count > int(window_block_index)
+    return valid_block_mask & has_target_rank & (valid_rank == target_rank)
+
+
+def _build_sparse_selection_component_keep_masks(
+    valid_block_mask: torch.Tensor,
+    *,
+    sink_block: int,
+    sliding_window_block: int,
+) -> dict[str, torch.Tensor]:
+    component_keep_masks: dict[str, torch.Tensor] = {}
+    mandatory_component_keep_masks: list[torch.Tensor] = []
+    if sink_block > 0:
+        sink_keep_mask = _build_mandatory_sparse_block_mask(
+            valid_block_mask,
+            sink_block=int(sink_block),
+            sliding_window_block=0,
+        )
+        component_keep_masks["sink_block"] = sink_keep_mask
+        mandatory_component_keep_masks.append(sink_keep_mask)
+    if sliding_window_block > 0:
+        sliding_window_keep_mask = _build_mandatory_sparse_block_mask(
+            valid_block_mask,
+            sink_block=0,
+            sliding_window_block=int(sliding_window_block),
+        )
+        component_keep_masks["sliding_window_block"] = sliding_window_keep_mask
+        mandatory_component_keep_masks.append(sliding_window_keep_mask)
+        for window_block_index in range(int(sliding_window_block)):
+            component_keep_masks[f"sliding_window_block_{window_block_index}"] = (
+                _build_sliding_window_component_keep_mask(
+                    valid_block_mask,
+                    sliding_window_block=int(sliding_window_block),
+                    window_block_index=window_block_index,
+                )
+            )
+    if mandatory_component_keep_masks:
+        mandatory_keep_mask = torch.zeros_like(valid_block_mask)
+        for keep_mask in mandatory_component_keep_masks:
+            mandatory_keep_mask = mandatory_keep_mask | keep_mask
+        component_keep_masks["mandatory_union"] = mandatory_keep_mask
+    return component_keep_masks
+
+
 def _select_topk_sparse_blocks(
     block_values: torch.Tensor, valid_block_mask: torch.Tensor, *, topk: int
 ) -> torch.Tensor:
@@ -1116,12 +1290,20 @@ def _merge_mandatory_and_sparse_blocks(
     *,
     cfg: SparsePrefillTopKConfig,
     block_probs: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    build_component_keep_masks: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    component_keep_masks: dict[str, torch.Tensor] = {}
     mandatory_keep_mask = _build_mandatory_sparse_block_mask(
         valid_block_mask,
         sink_block=int(cfg.sink_block),
         sliding_window_block=int(cfg.sliding_window_block),
     )
+    if build_component_keep_masks:
+        component_keep_masks = _build_sparse_selection_component_keep_masks(
+            valid_block_mask,
+            sink_block=int(cfg.sink_block),
+            sliding_window_block=int(cfg.sliding_window_block),
+        )
     selectable_block_mask = valid_block_mask & ~mandatory_keep_mask
     if cfg.topk is not None:
         additional_keep_mask = _select_topk_sparse_blocks(
@@ -1146,7 +1328,11 @@ def _merge_mandatory_and_sparse_blocks(
             required_mass=remaining_mass,
         )
     keep_block_mask = mandatory_keep_mask | additional_keep_mask
-    return keep_block_mask, keep_block_mask.sum(dim=-1).to(torch.int32)
+    return (
+        keep_block_mask,
+        keep_block_mask.sum(dim=-1).to(torch.int32),
+        component_keep_masks,
+    )
 
 
 def _keep_block_mask_to_block_indices(
@@ -1276,16 +1462,30 @@ def _build_sparse_attention_mask_topk(
             final_valid_block_mask=final_valid_block_mask,
         )
     else:
-        pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
         pooled_query = _mean_pool_attention_blocks(query, cfg.q_block)
         pooled_query, _ = _apply_gqa_shared_pooled_query(
             pooled_query,
             num_kv_heads=resolved_num_kv_heads,
             cfg=cfg,
         )
-        block_scores = (
-            torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
-        )
+        if cfg.k_sum:
+            token_valid_mask = _block_validity_from_token_mask(
+                allowed_token_mask,
+                q_block=cfg.q_block,
+                k_block=1,
+            )
+            block_scores, valid_block_mask = _build_k_sum_block_probs(
+                pooled_query,
+                key,
+                scaling=float(scaling),
+                token_valid_mask=token_valid_mask,
+                k_block=cfg.k_block,
+            )
+        else:
+            pooled_key = _mean_pool_attention_blocks(key, cfg.k_block)
+            block_scores = (
+                torch.matmul(pooled_query, pooled_key.transpose(-1, -2)) * scaling
+            )
         valid_block_mask = _block_validity_from_token_mask(
             allowed_token_mask,
             q_block=cfg.q_block,
@@ -1298,7 +1498,20 @@ def _build_sparse_attention_mask_topk(
         num_kv_heads=resolved_num_kv_heads,
         cfg=cfg,
     )
-    if gqa_shared_applied:
+    if cfg.k_sum:
+        block_probs = torch.where(
+            valid_block_mask,
+            block_scores,
+            torch.zeros_like(block_scores),
+        )
+        row_sums = block_probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
+        block_probs = torch.where(
+            row_has_valid,
+            block_probs / row_sums,
+            torch.zeros_like(block_probs),
+        )
+    elif gqa_shared_applied:
         block_probs = None
 
     masked_scores = torch.where(
@@ -1313,11 +1526,12 @@ def _build_sparse_attention_mask_topk(
             row_has_valid, block_probs, torch.zeros_like(block_probs)
         )
 
-    keep_block_mask, _ = _merge_mandatory_and_sparse_blocks(
+    keep_block_mask, _, _ = _merge_mandatory_and_sparse_blocks(
         masked_scores,
         valid_block_mask,
         cfg=cfg,
         block_probs=block_probs,
+        build_component_keep_masks=False,
     )
     keep_token_mask = _expand_sparse_block_mask_to_token_mask(
         keep_block_mask,

@@ -30,6 +30,7 @@ def _make_cfg(
     sliding_window_block: int = 0,
     gqa_shared: str = "none",
     xattn: bool = False,
+    k_sum: bool = False,
     xattn_stride: int | None = None,
 ) -> SparsePrefillTopKConfig:
     return SparsePrefillTopKConfig(
@@ -43,6 +44,7 @@ def _make_cfg(
         sliding_window_block=sliding_window_block,
         gqa_shared=gqa_shared,
         xattn=xattn,
+        k_sum=k_sum,
         xattn_stride=xattn_stride,
     )
 
@@ -184,6 +186,99 @@ def test_triton_sparse_prefill_matches_pytorch_cached_prefix(
     head_dim = 64
     cache_block_size = 16
     cfg = _make_cfg(topk=4, k_block=k_block)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    full_key = torch.randn(seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    full_value = torch.randn(
+        seq_len, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+    block_table_row = torch.tensor(
+        [3, 0, 5, 1, 6, 4, 2],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_cache = _build_paged_kv_cache(
+        key=full_key,
+        value=full_value,
+        block_table_row=block_table_row,
+        cache_block_size=cache_block_size,
+    )
+
+    reference = run_sparse_prefill_attention(
+        query=query,
+        key=full_key,
+        value=full_value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+    output = run_triton_sparse_prefill_attention(
+        query=query,
+        kv_cache=kv_cache,
+        block_table_row=block_table_row,
+        seq_len=seq_len,
+        kv_cache_dtype="auto",
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+
+    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_sparse_prefill_matches_pytorch_full_prefill_k_sum(
+    dtype: torch.dtype,
+):
+    torch.manual_seed(13)
+    q_len = 129
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    cfg = _make_cfg(topk=4, k_block=8, k_sum=True)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    query = torch.randn(q_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    key = torch.randn(q_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+    value = torch.randn(q_len, num_kv_heads, head_dim, device="cuda", dtype=dtype)
+
+    reference = run_sparse_prefill_attention(
+        query=query,
+        key=key,
+        value=value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+    output = run_triton_sparse_prefill_attention(
+        query=query,
+        key=key,
+        value=value,
+        scaling=scale,
+        cfg=cfg,
+        output_dtype=dtype,
+    )
+
+    atol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    rtol = 4e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_triton_sparse_prefill_matches_pytorch_cached_prefix_k_sum(
+    dtype: torch.dtype,
+):
+    torch.manual_seed(17)
+    seq_len = 97
+    query_len = 33
+    num_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    cache_block_size = 16
+    cfg = _make_cfg(topk=4, k_block=8, k_sum=True)
     scale = 1.0 / math.sqrt(head_dim)
 
     query = torch.randn(query_len, num_heads, head_dim, device="cuda", dtype=dtype)

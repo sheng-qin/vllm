@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     SparsePrefillSelectionStats,
     SparsePrefillTopKConfig,
     _apply_gqa_shared_block_scores,
+    _build_k_sum_block_probs,
     _build_xattn_block_scores_and_probs,
     _keep_block_mask_to_block_indices,
     _merge_mandatory_and_sparse_blocks,
@@ -27,6 +28,7 @@ from vllm.v1.attention.backends.sparse_prefill_utils import (
     format_sparse_prefill_selection_policy,
     format_sparse_prefill_per_head_payload,
     gather_full_sequence_kv_from_paged_cache,
+    is_sparse_prefill_component_retain_score_recording_enabled,
     resolve_sparse_prefill_layer_info,
     resolve_sparse_prefill_retain_score_log_mode,
     should_log_sparse_prefill_layer_info,
@@ -156,6 +158,8 @@ class SparseTopKBlockMetadata:
     q_abs_offset: int
     retain_tile_block_mask: torch.Tensor | None = None
     selection_stats: SparsePrefillSelectionStats | None = None
+    component_retain_tile_block_masks: dict[str, torch.Tensor] | None = None
+    component_selection_stats: dict[str, SparsePrefillSelectionStats] | None = None
 
 
 def _extract_unquantized_paged_kv(
@@ -373,6 +377,7 @@ def build_sparse_topk_block_metadata(
     k_len: int,
     build_retain_tile_block_mask: bool = False,
     record_selection_stats: bool = False,
+    record_component_selection_stats: bool = True,
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
     query_states = query.transpose(0, 1).unsqueeze(0)
@@ -396,7 +401,7 @@ def build_sparse_topk_block_metadata(
                 key_states,
                 query_states.shape[1] // key_states.shape[1],
             )
-    if not cfg.xattn:
+    if not cfg.xattn and not cfg.k_sum:
         if pooled_key is None:
             if key_states is None:
                 raise ValueError(
@@ -462,7 +467,6 @@ def build_sparse_topk_block_metadata(
             final_valid_block_mask=final_valid_block_mask,
         )
     else:
-        assert pooled_key is not None
         resolved_num_kv_heads = (
             query_states.shape[1]
             if original_num_kv_heads is None
@@ -483,24 +487,69 @@ def build_sparse_topk_block_metadata(
             num_kv_heads=resolved_num_kv_heads,
             cfg=cfg,
         )
-        block_scores = _timed_call(
-            breakdown,
-            "topk_score_matmul",
-            lambda: torch.matmul(
-                pooled_query.to(torch.float32),
-                pooled_key.to(torch.float32).transpose(-1, -2),
-            ) * float(scaling),
-        )
-        valid_block_mask = _timed_call(
-            breakdown,
-            "topk_build_mask",
-            _build_causal_valid_block_mask,
-            q_len=query.shape[0],
-            k_len=k_len,
-            q_block=cfg.q_block,
-            k_block=cfg.k_block,
-            device=query.device,
-        )
+        if cfg.k_sum:
+            if key_states is None:
+                raise ValueError(
+                    "Sparse Triton k_sum score construction requires dense key states."
+                )
+            token_valid_mask = _timed_call(
+                breakdown,
+                "topk_build_k_sum_token_mask",
+                _build_causal_valid_block_mask,
+                q_len=_ceil_div(query.shape[0], cfg.q_block),
+                k_len=k_len,
+                q_block=1,
+                k_block=1,
+                device=query.device,
+            )
+            if token_valid_mask.shape[1] != pooled_query.shape[1]:
+                token_valid_mask = token_valid_mask.expand(
+                    token_valid_mask.shape[0],
+                    pooled_query.shape[1],
+                    token_valid_mask.shape[2],
+                    token_valid_mask.shape[3],
+                )
+            block_scores = _timed_call(
+                breakdown,
+                "topk_k_sum_score",
+                _build_k_sum_block_probs,
+                pooled_query,
+                key_states,
+                scaling=float(scaling),
+                token_valid_mask=token_valid_mask,
+                k_block=cfg.k_block,
+            )[0]
+            valid_block_mask = _timed_call(
+                breakdown,
+                "topk_k_sum_valid_mask",
+                _build_causal_valid_block_mask,
+                q_len=query.shape[0],
+                k_len=k_len,
+                q_block=cfg.q_block,
+                k_block=cfg.k_block,
+                device=query.device,
+            )
+        else:
+            assert pooled_key is not None
+            block_scores = _timed_call(
+                breakdown,
+                "topk_score_matmul",
+                lambda: torch.matmul(
+                    pooled_query.to(torch.float32),
+                    pooled_key.to(torch.float32).transpose(-1, -2),
+                ) * float(scaling),
+            )
+        if not cfg.k_sum:
+            valid_block_mask = _timed_call(
+                breakdown,
+                "topk_build_mask",
+                _build_causal_valid_block_mask,
+                q_len=query.shape[0],
+                k_len=k_len,
+                q_block=cfg.q_block,
+                k_block=cfg.k_block,
+                device=query.device,
+            )
         if valid_block_mask.shape[1] != block_scores.shape[1]:
             valid_block_mask = valid_block_mask.expand(
                 valid_block_mask.shape[0],
@@ -523,7 +572,28 @@ def build_sparse_topk_block_metadata(
         num_kv_heads=resolved_num_kv_heads,
         cfg=cfg,
     )
-    if gqa_shared_applied:
+    if cfg.k_sum:
+        block_probs = _timed_call(
+            breakdown,
+            "topk_k_sum_normalize",
+            lambda: torch.where(
+                valid_block_mask,
+                block_scores,
+                torch.zeros_like(block_scores),
+            ),
+        )
+        row_sums = block_probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        row_has_valid = valid_block_mask.any(dim=-1, keepdim=True)
+        block_probs = _timed_call(
+            breakdown,
+            "topk_k_sum_row_normalize",
+            lambda: torch.where(
+                row_has_valid,
+                block_probs / row_sums,
+                torch.zeros_like(block_probs),
+            ),
+        )
+    elif gqa_shared_applied:
         block_probs = None
 
     masked_scores = _timed_call(
@@ -535,7 +605,7 @@ def build_sparse_topk_block_metadata(
             torch.full_like(block_scores, float("-inf")),
         ),
     )
-    if not cfg.xattn:
+    if not cfg.xattn and not cfg.k_sum:
         block_probs = None
     if block_probs is None and cfg.threshold is not None:
         block_probs = _timed_call(
@@ -549,7 +619,10 @@ def build_sparse_topk_block_metadata(
             block_probs,
             torch.zeros_like(block_probs),
         )
-    keep_block_mask, counts = _timed_call(
+    build_component_keep_masks = record_component_selection_stats and (
+        build_retain_tile_block_mask or record_selection_stats
+    )
+    keep_block_mask, counts, component_keep_masks = _timed_call(
         breakdown,
         "topk_select",
         _merge_mandatory_and_sparse_blocks,
@@ -557,6 +630,7 @@ def build_sparse_topk_block_metadata(
         valid_block_mask,
         cfg=cfg,
         block_probs=block_probs,
+        build_component_keep_masks=build_component_keep_masks,
     )
     selection_width = int(counts.max().item()) if counts.numel() > 0 else 0
     padded_topk_idx = _timed_call(
@@ -581,7 +655,32 @@ def build_sparse_topk_block_metadata(
         if build_retain_tile_block_mask
         else None
     )
+    component_retain_tile_block_masks = None
+    if build_retain_tile_block_mask and component_keep_masks:
+        component_retain_tile_block_masks = {}
+        for component_name, component_keep_mask in component_keep_masks.items():
+            component_counts = component_keep_mask.sum(dim=-1).to(torch.int32)
+            component_width = (
+                int(component_counts.max().item()) if component_counts.numel() > 0 else 0
+            )
+            component_topk_idx = _timed_call(
+                breakdown,
+                f"topk_pad_indices_{component_name}",
+                _keep_block_mask_to_block_indices,
+                component_keep_mask,
+                counts=component_counts,
+                full_topk=component_width,
+            )
+            component_retain_tile_block_masks[component_name] = _timed_call(
+                breakdown,
+                f"retain_build_tile_mask_{component_name}",
+                _build_retain_tile_block_mask,
+                component_topk_idx.squeeze(0).contiguous(),
+                seq_len=k_len,
+                k_block=int(cfg.k_block),
+            )
     selection_stats = None
+    component_selection_stats = None
     if record_selection_stats:
         if block_probs is not None:
             selection_stats = _timed_call(
@@ -601,6 +700,27 @@ def build_sparse_topk_block_metadata(
                 valid_block_mask=valid_block_mask,
                 keep_block_mask=keep_block_mask,
             )
+        if component_keep_masks:
+            component_selection_stats = {}
+            for component_name, component_keep_mask in component_keep_masks.items():
+                if block_probs is not None:
+                    component_selection_stats[component_name] = _timed_call(
+                        breakdown,
+                        f"topk_selection_stats_{component_name}",
+                        _summarize_sparse_block_selection,
+                        block_probs=block_probs,
+                        valid_block_mask=valid_block_mask,
+                        keep_block_mask=component_keep_mask,
+                    )
+                else:
+                    component_selection_stats[component_name] = _timed_call(
+                        breakdown,
+                        f"topk_selection_stats_{component_name}",
+                        _summarize_topk_block_selection,
+                        masked_scores=masked_scores,
+                        valid_block_mask=valid_block_mask,
+                        keep_block_mask=component_keep_mask,
+                    )
     return SparseTopKBlockMetadata(
         topk_block_indices=topk_block_indices,
         topk_block_counts=topk_block_counts,
@@ -609,6 +729,8 @@ def build_sparse_topk_block_metadata(
         q_abs_offset=k_len - query.shape[0],
         retain_tile_block_mask=retain_tile_block_mask,
         selection_stats=selection_stats,
+        component_retain_tile_block_masks=component_retain_tile_block_masks,
+        component_selection_stats=component_selection_stats,
     )
 
 
@@ -623,11 +745,12 @@ def build_sparse_topk_block_metadata_from_paged_cache(
     cfg: SparsePrefillTopKConfig,
     build_retain_tile_block_mask: bool = False,
     record_selection_stats: bool = False,
+    record_component_selection_stats: bool = True,
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> SparseTopKBlockMetadata:
     pooled_key = None
     full_key = None
-    if cfg.xattn:
+    if cfg.xattn or cfg.k_sum:
         num_kv_heads = int(kv_cache.shape[3])
         head_dim = int(kv_cache.shape[4])
         full_key, _ = _timed_call(
@@ -667,6 +790,7 @@ def build_sparse_topk_block_metadata_from_paged_cache(
         k_len=seq_len,
         build_retain_tile_block_mask=build_retain_tile_block_mask,
         record_selection_stats=record_selection_stats,
+        record_component_selection_stats=record_component_selection_stats,
         breakdown=breakdown,
     )
 
@@ -1602,10 +1726,13 @@ def _compute_paged_retain_scores(
     topk_metadata: SparseTopKBlockMetadata,
     scaling: float,
     cfg: SparsePrefillTopKConfig,
+    retain_tile_block_mask: torch.Tensor | None = None,
     breakdown: SparsePrefillTimingBreakdown | None = None,
 ) -> torch.Tensor:
     """Compute per-token retain scores for paged KV. Returns [q_len, num_heads] float32."""
-    retain_block_mask = topk_metadata.retain_tile_block_mask
+    retain_block_mask = retain_tile_block_mask
+    if retain_block_mask is None:
+        retain_block_mask = topk_metadata.retain_tile_block_mask
     if retain_block_mask is None:
         raise ValueError(
             "Paged retain-score kernel requires precomputed retain_tile_block_mask."
@@ -1711,6 +1838,7 @@ def _log_triton_retain_score_stats(
     paged_kv: bool,
     selection_stats: SparsePrefillSelectionStats | None,
     approx_selection_stats: SparsePrefillSelectionStats | None = None,
+    component_name: str | None = None,
     retain_score_log_mode: SparsePrefillRetainScoreLogMode,
 ) -> None:
     if selection_stats is None:
@@ -1720,13 +1848,14 @@ def _log_triton_retain_score_stats(
     layer_idx = None
     layer_name = None
     selection_policy = format_sparse_prefill_selection_policy(cfg)
+    component_prefix = f"component={component_name} " if component_name else ""
     approx_retain_mass = approx_selection_stats.retained_attention_score_mean
     if should_log_sparse_prefill_layer_info(retain_score_log_mode):
         layer_idx, layer_name = resolve_sparse_prefill_layer_info(layer)
         logger.info(
             "Sparse prefill Triton retain-score stats: layer_idx=%s "
             "layer_name=%s q_len=%d seq_len=%d path=%s q_block=%d k_block=%d "
-            "%s approx_retain_mass=%.6f avg_retain_score=%.6f density=%.6f valid_rows=%d "
+            "%s%s approx_retain_mass=%.6f avg_retain_score=%.6f density=%.6f valid_rows=%d "
             "kept_blocks=%d valid_blocks=%d.",
             layer_idx if layer_idx is not None else "NA",
             layer_name or "unknown",
@@ -1735,6 +1864,7 @@ def _log_triton_retain_score_stats(
             "paged" if paged_kv else "contiguous",
             int(cfg.q_block),
             int(cfg.k_block),
+            component_prefix,
             selection_policy,
             approx_retain_mass,
             selection_stats.retained_attention_score_mean,
@@ -1746,13 +1876,14 @@ def _log_triton_retain_score_stats(
     else:
         logger.info(
             "Sparse prefill Triton retain-score stats: q_len=%d seq_len=%d "
-            "path=%s q_block=%d k_block=%d %s approx_retain_mass=%.6f avg_retain_score=%.6f "
+            "path=%s q_block=%d k_block=%d %s%s approx_retain_mass=%.6f avg_retain_score=%.6f "
             "density=%.6f valid_rows=%d kept_blocks=%d valid_blocks=%d.",
             int(query_len),
             int(seq_len),
             "paged" if paged_kv else "contiguous",
             int(cfg.q_block),
             int(cfg.k_block),
+            component_prefix,
             selection_policy,
             approx_retain_mass,
             selection_stats.retained_attention_score_mean,
@@ -1761,7 +1892,10 @@ def _log_triton_retain_score_stats(
             selection_stats.total_kept_blocks,
             selection_stats.total_valid_blocks,
         )
-    if should_log_sparse_prefill_per_head_stats(retain_score_log_mode):
+    if (
+        component_name is None
+        and should_log_sparse_prefill_per_head_stats(retain_score_log_mode)
+    ):
         per_head_payload = format_sparse_prefill_per_head_payload(selection_stats)
         logger.info(
             "Sparse prefill Triton retain-score per-head stats: layer_idx=%s "
@@ -1800,6 +1934,7 @@ def run_triton_sparse_prefill_attention(
     record_retain_score: bool = False,
     retain_score_log_mode: SparsePrefillRetainScoreLogMode | None = None,
     layer: object | None = None,
+    record_component_retain_score: bool | None = None,
 ) -> torch.Tensor:
     if not HAS_TRITON:
         raise RuntimeError("Triton is not available for sparse prefill attention.")
@@ -1819,6 +1954,15 @@ def run_triton_sparse_prefill_attention(
         record_retain_score=record_retain_score,
         retain_score_log_mode=retain_score_log_mode,
     )
+    if record_component_retain_score is None:
+        record_component_retain_score = (
+            resolved_log_mode != "off"
+            and is_sparse_prefill_component_retain_score_recording_enabled()
+        )
+    else:
+        record_component_retain_score = (
+            resolved_log_mode != "off" and record_component_retain_score
+        )
 
     if kv_cache is not None and block_table_row is not None and seq_len is not None:
         topk_metadata = build_sparse_topk_block_metadata_from_paged_cache(
@@ -1831,10 +1975,17 @@ def run_triton_sparse_prefill_attention(
             cfg=cfg,
             build_retain_tile_block_mask=resolved_log_mode != "off",
             record_selection_stats=resolved_log_mode != "off",
+            record_component_selection_stats=record_component_retain_score,
             breakdown=timing_breakdown,
         )
         approx_selection_stats_for_log = topk_metadata.selection_stats
         selection_stats_for_log = approx_selection_stats_for_log
+        component_approx_selection_stats_for_log = (
+            dict(topk_metadata.component_selection_stats)
+            if topk_metadata.component_selection_stats is not None
+            else {}
+        )
+        component_selection_stats_for_log = dict(component_approx_selection_stats_for_log)
         should_compute_token_retain = (
             resolved_log_mode != "off"
             and topk_metadata.selection_stats is not None
@@ -1859,6 +2010,36 @@ def run_triton_sparse_prefill_attention(
             selection_stats_for_log = _build_token_level_retain_stats(
                 per_token_scores, topk_metadata.selection_stats,
             )
+            if topk_metadata.component_retain_tile_block_masks is not None:
+                for (
+                    component_name,
+                    approx_component_stats,
+                ) in component_approx_selection_stats_for_log.items():
+                    component_retain_tile_block_mask = (
+                        topk_metadata.component_retain_tile_block_masks.get(
+                            component_name
+                        )
+                    )
+                    if component_retain_tile_block_mask is None:
+                        continue
+                    component_per_token_scores = _compute_paged_retain_scores(
+                        query=query,
+                        kv_cache=kv_cache,
+                        block_table_row=block_table_row,
+                        seq_len=seq_len,
+                        kv_cache_dtype=kv_cache_dtype,
+                        topk_metadata=topk_metadata,
+                        scaling=scaling,
+                        cfg=cfg,
+                        retain_tile_block_mask=component_retain_tile_block_mask,
+                        breakdown=timing_breakdown,
+                    )
+                    component_selection_stats_for_log[component_name] = (
+                        _build_token_level_retain_stats(
+                            component_per_token_scores,
+                            approx_component_stats,
+                        )
+                    )
         _log_triton_retain_score_stats(
             layer=layer,
             query_len=int(query.shape[0]),
@@ -1869,6 +2050,21 @@ def run_triton_sparse_prefill_attention(
             approx_selection_stats=approx_selection_stats_for_log,
             retain_score_log_mode=resolved_log_mode,
         )
+        for (
+            component_name,
+            approx_component_stats,
+        ) in component_approx_selection_stats_for_log.items():
+            _log_triton_retain_score_stats(
+                layer=layer,
+                query_len=int(query.shape[0]),
+                seq_len=int(seq_len),
+                cfg=cfg,
+                paged_kv=True,
+                selection_stats=component_selection_stats_for_log.get(component_name),
+                approx_selection_stats=approx_component_stats,
+                component_name=component_name,
+                retain_score_log_mode=resolved_log_mode,
+            )
         _log_fully_masked_row_debug(
             topk_metadata=topk_metadata,
             q_len=int(query.shape[0]),
@@ -1907,21 +2103,24 @@ def run_triton_sparse_prefill_attention(
             "(kv_cache, block_table_row, seq_len)."
         )
 
-    pooled_key = _timed_call(
-        timing_breakdown,
-        "contiguous_pool_key",
-        _mean_pool_attention_blocks,
-        key.transpose(0, 1).unsqueeze(0),
-        cfg.k_block,
-    )
+    pooled_key = None
+    if not cfg.k_sum:
+        pooled_key = _timed_call(
+            timing_breakdown,
+            "contiguous_pool_key",
+            _mean_pool_attention_blocks,
+            key.transpose(0, 1).unsqueeze(0),
+            cfg.k_block,
+        )
     topk_metadata = build_sparse_topk_block_metadata(
         query=query,
         pooled_key=pooled_key,
-        key=key if cfg.xattn else None,
+        key=key if (cfg.xattn or cfg.k_sum) else None,
         scaling=scaling,
         cfg=cfg,
         k_len=key.shape[0],
         record_selection_stats=resolved_log_mode != "off",
+        record_component_selection_stats=record_component_retain_score,
         breakdown=timing_breakdown,
     )
     if (
@@ -1946,6 +2145,19 @@ def run_triton_sparse_prefill_attention(
         approx_selection_stats=topk_metadata.selection_stats,
         retain_score_log_mode=resolved_log_mode,
     )
+    if topk_metadata.component_selection_stats is not None:
+        for component_name, component_stats in topk_metadata.component_selection_stats.items():
+            _log_triton_retain_score_stats(
+                layer=layer,
+                query_len=int(query.shape[0]),
+                seq_len=int(key.shape[0]),
+                cfg=cfg,
+                paged_kv=False,
+                selection_stats=component_stats,
+                approx_selection_stats=component_stats,
+                component_name=component_name,
+                retain_score_log_mode=resolved_log_mode,
+            )
     _log_fully_masked_row_debug(
         topk_metadata=topk_metadata,
         q_len=int(query.shape[0]),
